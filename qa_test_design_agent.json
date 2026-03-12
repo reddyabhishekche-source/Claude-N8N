@@ -91,7 +91,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Filter test cases linked to the story\nconst zephyrResponse = $input.first().json;\nconst storyData = $('Parse JIRA Story').first().json;\n\nconst testCases = zephyrResponse.values || zephyrResponse.testCases || [];\nconst issueId = storyData.issue_id;\nconst storyKey = storyData.story_id;\n\nconst linkedTestCases = testCases.filter(tc => {\n  const links = tc.linkedIssues || tc.issueLinks || [];\n  return links.some(link => {\n    const id = link.issueId || link.id || '';\n    const key = link.issueKey || link.key || '';\n    return String(id) === String(issueId) || key === storyKey;\n  });\n});\n\nreturn [{\n  json: {\n    story_id: storyKey,\n    issue_id: issueId,\n    summary: storyData.summary,\n    description: storyData.description,\n    acceptance_criteria: storyData.acceptance_criteria,\n    all_testcases_count: testCases.length,\n    linked_testcases: linkedTestCases.map(tc => ({\n      key: tc.key || tc.testCaseKey || '',\n      name: tc.name || tc.title || '',\n      objective: tc.objective || '',\n      status: tc.status?.name || tc.statusName || '',\n      steps: (tc.testScript?.stepByStepScript?.steps ||\n              tc.steps || []).map(s => ({\n        description: s.description || '',\n        expectedResult: s.expectedResult || ''\n      }))\n    }))\n  }\n}];"
+        "jsCode": "// Filter test cases linked to the story\nconst zephyrResponse = $input.first().json;\nconst storyData = $('Parse JIRA Story').first().json;\n\nconst testCases = zephyrResponse.values || zephyrResponse.testCases || [];\nconst issueId = storyData.issue_id;\nconst storyKey = storyData.story_id;\n\nconst linkedTestCases = testCases.filter(tc => {\n  const links = tc.linkedIssues || tc.issueLinks || tc.links?.issues || [];\n  return links.some(link => {\n    const id = link.issueId || link.id || '';\n    const key = link.issueKey || link.key || '';\n    const target = link.target || '';\n    return (\n      String(id) === String(issueId) ||\n      key === storyKey ||\n      target.includes(issueId)\n    );\n  });\n});\n\nreturn [{\n  json: {\n    story_id: storyKey,\n    issue_id: issueId,\n    summary: storyData.summary,\n    description: storyData.description,\n    acceptance_criteria: storyData.acceptance_criteria,\n    all_testcases_count: testCases.length,\n    linked_testcases: linkedTestCases.map(tc => ({\n      key: tc.key || tc.testCaseKey || '',\n      name: tc.name || tc.title || '',\n      objective: tc.objective || '',\n      precondition: tc.precondition || '',\n      status: tc.status?.name || tc.statusName || '',\n      steps: (tc.testScript?.stepByStepScript?.steps || tc.steps || []).map(s => ({\n        description: s.description || '',\n        expectedResult: s.expectedResult || ''\n      }))\n    }))\n  }\n}];"
       },
       "id": "node-filter-linked-testcases",
       "name": "Filter Linked Test Cases",
@@ -101,25 +101,125 @@
     },
     {
       "parameters": {
+        "jsCode": "// Detect duplicate test cases using Jaccard similarity on name and objective.\n// Duplicates are removed from the active list; their keys are queued for deletion.\nconst data = $input.first().json;\nconst testcases = data.linked_testcases || [];\n\nfunction normalize(str) {\n  return (str || '')\n    .toLowerCase()\n    .replace(/[^a-z0-9\\s]/g, '')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction jaccardSimilarity(a, b) {\n  const tokensA = new Set(normalize(a).split(' ').filter(Boolean));\n  const tokensB = new Set(normalize(b).split(' ').filter(Boolean));\n  if (tokensA.size === 0 || tokensB.size === 0) return 0;\n  const intersection = new Set([...tokensA].filter(x => tokensB.has(x)));\n  const union = new Set([...tokensA, ...tokensB]);\n  return intersection.size / union.size;\n}\n\n// NAME similarity >= 0.75 OR OBJECTIVE similarity >= 0.85 = duplicate\nconst THRESHOLD_NAME = 0.75;\nconst THRESHOLD_OBJ  = 0.85;\n\nconst duplicateGroups = [];\nconst toDeleteIndices = new Set();\n\nfor (let i = 0; i < testcases.length; i++) {\n  if (toDeleteIndices.has(i)) continue;\n\n  const group = {\n    keep: testcases[i].key,\n    keep_name: testcases[i].name,\n    duplicates: []\n  };\n\n  for (let j = i + 1; j < testcases.length; j++) {\n    if (toDeleteIndices.has(j)) continue;\n\n    const nameSim = jaccardSimilarity(testcases[i].name, testcases[j].name);\n    const objSim  = jaccardSimilarity(testcases[i].objective, testcases[j].objective);\n\n    if (nameSim >= THRESHOLD_NAME || objSim >= THRESHOLD_OBJ) {\n      group.duplicates.push({\n        key: testcases[j].key,\n        name: testcases[j].name,\n        similarity_score: Math.max(nameSim, objSim).toFixed(2)\n      });\n      toDeleteIndices.add(j);\n    }\n  }\n\n  if (group.duplicates.length > 0) {\n    duplicateGroups.push(group);\n  }\n}\n\nconst keysToDelete   = [...toDeleteIndices].map(i => testcases[i].key);\nconst cleanTestcases = testcases.filter((_, i) => !toDeleteIndices.has(i));\n\nreturn [{\n  json: {\n    ...data,\n    linked_testcases: cleanTestcases,\n    duplicate_groups: duplicateGroups,\n    keys_to_delete: keysToDelete,\n    has_duplicates: keysToDelete.length > 0\n  }\n}];"
+      },
+      "id": "node-detect-duplicates",
+      "name": "Detect Duplicates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "check-has-duplicates",
+              "leftValue": "={{ $json.has_duplicates }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true
+      },
+      "id": "node-if-duplicates-exist",
+      "name": "IF Duplicates Exist",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1540, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Split the keys_to_delete array into individual items so the\n// Delete node processes each one separately.\nconst data = $input.first().json;\nconst keysToDelete = data.keys_to_delete || [];\n\nif (keysToDelete.length === 0) return [];\n\nreturn keysToDelete.map(key => ({ json: { key_to_delete: key } }));"
+      },
+      "id": "node-extract-duplicate-keys",
+      "name": "Extract Duplicate Keys",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, 80]
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "=https://prod-api.zephyr4jiracloud.com/v2/testcases/{{$json.key_to_delete}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$vars.ZEPHYR_API_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-delete-duplicate-testcase",
+      "name": "Delete Duplicate Test Case",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1980, 80]
+    },
+    {
+      "parameters": {
+        "jsCode": "// All duplicate deletions are done. Restore the clean story data\n// (with duplicates already removed from linked_testcases) so downstream\n// nodes receive a single, authoritative item.\nconst storyData = $('Detect Duplicates').first().json;\nreturn [{ json: storyData }];"
+      },
+      "id": "node-restore-story-after-delete",
+      "name": "Restore Story After Delete",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2200, 80]
+    },
+    {
+      "parameters": {
+        "mode": "append"
+      },
+      "id": "node-merge-after-dedup",
+      "name": "Merge After Dedup",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [2420, 300]
+    },
+    {
+      "parameters": {
         "model": "claude-sonnet-4-6",
         "messages": {
           "values": [
             {
               "role": "user",
-              "content": "=You are a senior QA engineer. Analyze the following JIRA user story and its existing test cases, then perform two tasks.\n\n## JIRA Story\nStory ID: {{$json.story_id}}\nSummary: {{$json.summary}}\n\nDescription:\n{{$json.description}}\n\nAcceptance Criteria:\n{{$json.acceptance_criteria}}\n\n## Existing Test Cases ({{$json.linked_testcases.length}} linked)\n{{JSON.stringify($json.linked_testcases, null, 2)}}\n\n---\n\n## TASK 1 — Coverage Summary\nSummarize what is already covered by the existing test cases. Structure it as:\n- Functional scenarios covered\n- Edge cases covered\n- Validation checks covered\n- Negative scenarios covered\n\n## TASK 2 — Missing Scenarios\nIdentify ALL testing gaps. Consider:\n- Boundary conditions not tested\n- Negative / error paths not covered\n- Validation rules not verified\n- Error handling scenarios\n- Integration / end-to-end flows\n- Any acceptance criteria not covered by existing tests\n\nReturn your analysis as valid JSON only (no markdown fences, no extra text) in this exact structure:\n{\n  \"coverage_summary\": {\n    \"functional_scenarios\": [\"...\"],\n    \"edge_cases\": [\"...\"],\n    \"validation_checks\": [\"...\"],\n    \"negative_scenarios\": [\"...\"]\n  },\n  \"missing_scenarios\": [\n    {\n      \"title\": \"short title\",\n      \"description\": \"what needs to be tested and why it is missing\",\n      \"category\": \"boundary|negative|validation|error_handling|integration|functional\"\n    }\n  ]\n}"
+              "content": "=You are a senior QA engineer. Analyze the JIRA user story and its existing test cases.\n\n## JIRA Story\nStory ID: {{$json.story_id}}\nSummary: {{$json.summary}}\n\nDescription:\n{{$json.description}}\n\nAcceptance Criteria:\n{{$json.acceptance_criteria}}\n\n## Existing Test Cases ({{$json.linked_testcases.length}} linked)\n{{JSON.stringify($json.linked_testcases, null, 2)}}\n\n---\n\n## TASK 1 — Coverage Summary\nSummarize what is already covered by the existing test cases. Structure it as:\n- Functional scenarios covered\n- Edge cases covered\n- Validation checks covered\n- Negative scenarios covered\n\n## TASK 2 — Missing Scenarios (APPLY STRICT CRITERIA)\n\nCRITICAL RULES — you MUST follow all of these:\n1. Only mark a scenario as \"missing\" if it is COMPLETELY absent from ALL existing test cases.\n2. Do NOT suggest variations or re-phrasings of scenarios already covered.\n3. Do NOT flag minor edge cases that are implied or obviously addressed by existing tests.\n4. Only flag gaps that represent a HIGH or CRITICAL quality risk:\n   - Acceptance criteria that have zero existing test coverage\n   - Security or data-integrity issues that are entirely untested\n   - Error-handling paths that are completely absent\n   - Critical integration flows with no coverage\n5. When in doubt, leave the scenario out. A false positive (unnecessary test) is worse than a false negative here.\n6. If the existing test cases adequately cover all acceptance criteria, return an EMPTY array for missing_scenarios.\n\nReturn ONLY valid JSON (no markdown fences, no extra text) in this exact structure:\n{\n  \"coverage_summary\": {\n    \"functional_scenarios\": [\"...\"],\n    \"edge_cases\": [\"...\"],\n    \"validation_checks\": [\"...\"],\n    \"negative_scenarios\": [\"...\"]\n  },\n  \"missing_scenarios\": [\n    {\n      \"title\": \"short title\",\n      \"description\": \"what needs to be tested and why it is COMPLETELY missing from existing tests\",\n      \"category\": \"boundary|negative|validation|error_handling|integration|functional\",\n      \"risk_level\": \"critical|high\"\n    }\n  ]\n}\n\nIMPORTANT: missing_scenarios must only contain HIGH or CRITICAL risk items that are truly absent. Return [] if coverage is adequate."
             }
           ]
         },
         "options": {
           "maxTokens": 4000,
-          "temperature": 0.2
+          "temperature": 0.1
         }
       },
       "id": "node-analyze-coverage",
       "name": "Analyze Coverage (Claude)",
       "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
       "typeVersion": 1.2,
-      "position": [1320, 300],
+      "position": [2640, 300],
       "credentials": {
         "anthropicApi": {
           "id": "anthropic-api-cred",
@@ -129,13 +229,42 @@
     },
     {
       "parameters": {
-        "jsCode": "// Parse Claude's coverage analysis response\nconst claudeResponse = $input.first().json;\nconst filterData = $('Filter Linked Test Cases').first().json;\n\nlet analysisText = claudeResponse.text ||\n  claudeResponse.content?.[0]?.text ||\n  claudeResponse.message?.content?.[0]?.text ||\n  claudeResponse.output?.[0]?.text ||\n  JSON.stringify(claudeResponse);\n\n// Strip markdown code fences if present\nanalysisText = analysisText.replace(/```json\\s*/gi, '').replace(/```\\s*/g, '').trim();\n\nlet analysis;\ntry {\n  analysis = JSON.parse(analysisText);\n} catch (e) {\n  // Try to extract JSON from the text\n  const jsonMatch = analysisText.match(/\\{[\\s\\S]*\\}/);\n  if (jsonMatch) {\n    analysis = JSON.parse(jsonMatch[0]);\n  } else {\n    throw new Error('Failed to parse Claude coverage analysis: ' + analysisText.slice(0, 500));\n  }\n}\n\nreturn [{\n  json: {\n    ...filterData,\n    coverage_summary: analysis.coverage_summary || {},\n    missing_scenarios: analysis.missing_scenarios || []\n  }\n}];"
+        "jsCode": "// Parse Claude's coverage analysis response\nconst claudeResponse = $input.first().json;\nconst filterData = $('Merge After Dedup').first().json;\n\nlet analysisText = claudeResponse.text ||\n  claudeResponse.content?.[0]?.text ||\n  claudeResponse.message?.content?.[0]?.text ||\n  claudeResponse.output?.[0]?.text ||\n  JSON.stringify(claudeResponse);\n\n// Strip markdown code fences if present\nanalysisText = analysisText.replace(/```json\\s*/gi, '').replace(/```\\s*/g, '').trim();\n\nlet analysis;\ntry {\n  analysis = JSON.parse(analysisText);\n} catch (e) {\n  const jsonMatch = analysisText.match(/\\{[\\s\\S]*\\}/);\n  if (jsonMatch) {\n    analysis = JSON.parse(jsonMatch[0]);\n  } else {\n    throw new Error('Failed to parse Claude coverage analysis: ' + analysisText.slice(0, 500));\n  }\n}\n\n// Only keep HIGH and CRITICAL risk missing scenarios\nconst filteredMissing = (analysis.missing_scenarios || []).filter(\n  s => s.risk_level === 'critical' || s.risk_level === 'high'\n);\n\nreturn [{\n  json: {\n    ...filterData,\n    coverage_summary: analysis.coverage_summary || {},\n    missing_scenarios: filteredMissing\n  }\n}];"
       },
       "id": "node-parse-coverage-analysis",
       "name": "Parse Coverage Analysis",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1540, 300]
+      "position": [2860, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "check-has-gaps",
+              "leftValue": "={{ $json.missing_scenarios.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true
+      },
+      "id": "node-if-gaps-found",
+      "name": "IF Gaps Found",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [3080, 300]
     },
     {
       "parameters": {
@@ -144,20 +273,20 @@
           "values": [
             {
               "role": "user",
-              "content": "=You are a senior QA engineer. Generate detailed, executable test cases for the missing scenarios identified below.\n\n## JIRA Story\nStory ID: {{$json.story_id}}\nSummary: {{$json.summary}}\n\nDescription:\n{{$json.description}}\n\nAcceptance Criteria:\n{{$json.acceptance_criteria}}\n\n## Missing Scenarios to Cover\n{{JSON.stringify($json.missing_scenarios, null, 2)}}\n\n## Existing Test Cases (DO NOT DUPLICATE)\n{{JSON.stringify($json.linked_testcases.map(tc => tc.name), null, 2)}}\n\n---\n\nGenerate one test case per missing scenario. Each test case must be thorough, with atomic steps and clear expected results.\n\nReturn ONLY valid JSON (no markdown fences, no extra text) as an array:\n[\n  {\n    \"name\": \"TC: <concise name describing what is tested>\",\n    \"objective\": \"<one sentence stating the goal of this test>\",\n    \"precondition\": \"<system state required before executing this test>\",\n    \"steps\": [\n      {\n        \"description\": \"<action to perform — be specific>\",\n        \"expectedResult\": \"<what the system should do/show>\"\n      }\n    ]\n  }\n]"
+              "content": "=You are a senior QA engineer. Generate detailed, executable test cases for the missing scenarios listed below.\n\n## JIRA Story\nStory ID: {{$json.story_id}}\nSummary: {{$json.summary}}\n\nDescription:\n{{$json.description}}\n\nAcceptance Criteria:\n{{$json.acceptance_criteria}}\n\n## Missing Scenarios to Cover ({{$json.missing_scenarios.length}} gaps)\n{{JSON.stringify($json.missing_scenarios, null, 2)}}\n\n## Existing Test Cases — DO NOT DUPLICATE ANY OF THESE\n{{JSON.stringify($json.linked_testcases.map(tc => ({ key: tc.key, name: tc.name, objective: tc.objective })), null, 2)}}\n\n---\n\nSTRICT RULES:\n1. Generate EXACTLY one test case per missing scenario — no more.\n2. Do NOT create additional edge cases, variations, or \"nice to have\" tests.\n3. Each test case must directly address its specific missing scenario.\n4. Do NOT duplicate or closely resemble any existing test case above.\n\nReturn ONLY valid JSON (no markdown fences, no extra text) as an array:\n[\n  {\n    \"name\": \"TC: <concise name describing what is tested>\",\n    \"objective\": \"<one sentence stating the goal of this test>\",\n    \"precondition\": \"<system state required before executing this test>\",\n    \"steps\": [\n      {\n        \"description\": \"<action to perform — be specific>\",\n        \"expectedResult\": \"<what the system should do/show>\"\n      }\n    ]\n  }\n]"
             }
           ]
         },
         "options": {
           "maxTokens": 8000,
-          "temperature": 0.2
+          "temperature": 0.1
         }
       },
       "id": "node-generate-testcases",
       "name": "Generate New Test Cases (Claude)",
       "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
       "typeVersion": 1.2,
-      "position": [1760, 300],
+      "position": [3300, 80],
       "credentials": {
         "anthropicApi": {
           "id": "anthropic-api-cred",
@@ -167,13 +296,13 @@
     },
     {
       "parameters": {
-        "jsCode": "// Parse generated test cases from Claude\nconst claudeResponse = $input.first().json;\nconst coverageData = $('Parse Coverage Analysis').first().json;\n\nlet tcText = claudeResponse.text ||\n  claudeResponse.content?.[0]?.text ||\n  claudeResponse.message?.content?.[0]?.text ||\n  claudeResponse.output?.[0]?.text ||\n  JSON.stringify(claudeResponse);\n\n// Strip markdown code fences\ntcText = tcText.replace(/```json\\s*/gi, '').replace(/```\\s*/g, '').trim();\n\nlet newTestCases;\ntry {\n  newTestCases = JSON.parse(tcText);\n} catch (e) {\n  const jsonMatch = tcText.match(/\\[[\\s\\S]*\\]/);\n  if (jsonMatch) {\n    newTestCases = JSON.parse(jsonMatch[0]);\n  } else {\n    throw new Error('Failed to parse generated test cases: ' + tcText.slice(0, 500));\n  }\n}\n\nif (!Array.isArray(newTestCases)) {\n  newTestCases = [newTestCases];\n}\n\n// Store coverage data in a static field for downstream nodes\nconst projectKey = coverageData.story_id.split('-')[0];\n\nreturn newTestCases.map(tc => ({\n  json: {\n    testcase: tc,\n    story_id: coverageData.story_id,\n    issue_id: coverageData.issue_id,\n    project_key: projectKey,\n    coverage_summary: coverageData.coverage_summary,\n    missing_scenarios: coverageData.missing_scenarios,\n    linked_testcases: coverageData.linked_testcases,\n    summary: coverageData.summary\n  }\n}));"
+        "jsCode": "// Parse generated test cases from Claude\nconst claudeResponse = $input.first().json;\nconst coverageData = $('Parse Coverage Analysis').first().json;\n\nlet tcText = claudeResponse.text ||\n  claudeResponse.content?.[0]?.text ||\n  claudeResponse.message?.content?.[0]?.text ||\n  claudeResponse.output?.[0]?.text ||\n  JSON.stringify(claudeResponse);\n\n// Strip markdown code fences\ntcText = tcText.replace(/```json\\s*/gi, '').replace(/```\\s*/g, '').trim();\n\nlet newTestCases;\ntry {\n  newTestCases = JSON.parse(tcText);\n} catch (e) {\n  const jsonMatch = tcText.match(/\\[[\\s\\S]*\\]/);\n  if (jsonMatch) {\n    newTestCases = JSON.parse(jsonMatch[0]);\n  } else {\n    throw new Error('Failed to parse generated test cases: ' + tcText.slice(0, 500));\n  }\n}\n\nif (!Array.isArray(newTestCases)) {\n  newTestCases = [newTestCases];\n}\n\nconst projectKey = coverageData.story_id.split('-')[0];\n\nreturn newTestCases.map(tc => ({\n  json: {\n    testcase: tc,\n    story_id: coverageData.story_id,\n    issue_id: coverageData.issue_id,\n    project_key: projectKey,\n    coverage_summary: coverageData.coverage_summary,\n    missing_scenarios: coverageData.missing_scenarios,\n    linked_testcases: coverageData.linked_testcases,\n    duplicate_groups: coverageData.duplicate_groups,\n    summary: coverageData.summary\n  }\n}));"
       },
       "id": "node-parse-new-testcases",
       "name": "Parse New Test Cases",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1980, 300]
+      "position": [3520, 80]
     },
     {
       "parameters": {
@@ -207,17 +336,17 @@
       "name": "Create Zephyr Test Case",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2200, 300]
+      "position": [3740, 80]
     },
     {
       "parameters": {
-        "jsCode": "// Extract the created test case key from Zephyr response\nconst zephyrResponse = $input.first().json;\nconst inputData = $('Parse New Test Cases').first().json;\n\nconst testcaseKey = zephyrResponse.key ||\n  zephyrResponse.testCaseKey ||\n  zephyrResponse.id ||\n  zephyrResponse.testCase?.key;\n\nif (!testcaseKey) {\n  throw new Error('Could not extract testcase key from Zephyr response: ' + JSON.stringify(zephyrResponse).slice(0, 300));\n}\n\nreturn [{\n  json: {\n    testcase_key: testcaseKey,\n    testcase_name: inputData.testcase?.name || '',\n    issue_id: inputData.issue_id,\n    story_id: inputData.story_id,\n    project_key: inputData.project_key,\n    coverage_summary: inputData.coverage_summary,\n    missing_scenarios: inputData.missing_scenarios,\n    linked_testcases: inputData.linked_testcases,\n    summary: inputData.summary\n  }\n}];"
+        "jsCode": "// Extract the created test case key from Zephyr response\nconst zephyrResponse = $input.first().json;\nconst inputData = $('Parse New Test Cases').first().json;\n\nconst testcaseKey = zephyrResponse.key ||\n  zephyrResponse.testCaseKey ||\n  zephyrResponse.id ||\n  zephyrResponse.testCase?.key;\n\nif (!testcaseKey) {\n  throw new Error('Could not extract testcase key from Zephyr response: ' + JSON.stringify(zephyrResponse).slice(0, 300));\n}\n\nreturn [{\n  json: {\n    testcase_key: testcaseKey,\n    testcase_name: inputData.testcase?.name || '',\n    issue_id: inputData.issue_id,\n    story_id: inputData.story_id,\n    project_key: inputData.project_key,\n    coverage_summary: inputData.coverage_summary,\n    missing_scenarios: inputData.missing_scenarios,\n    linked_testcases: inputData.linked_testcases,\n    duplicate_groups: inputData.duplicate_groups,\n    summary: inputData.summary\n  }\n}];"
       },
       "id": "node-extract-testcase-key",
       "name": "Extract Test Case Key",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2420, 300]
+      "position": [3960, 80]
     },
     {
       "parameters": {
@@ -251,17 +380,37 @@
       "name": "Link Test Case to Story",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2640, 300]
+      "position": [4180, 80]
     },
     {
       "parameters": {
-        "jsCode": "// Aggregate all results for final output\nconst allItems = $input.all();\n\n// Get stable data from the first item (all items share story context)\nconst firstItem = allItems[0]?.json || {};\nconst linked = $('Extract Test Case Key').all() || [];\n\nconst newTestCasesCreated = linked.map(item => ({\n  key: item.json.testcase_key,\n  name: item.json.testcase_name\n}));\n\n// Build final structured output\nconst finalOutput = {\n  story: {\n    id: firstItem.story_id || '',\n    summary: firstItem.summary || ''\n  },\n  coverage_summary: firstItem.coverage_summary || {},\n  existing_testcases: (firstItem.linked_testcases || []).map(tc => ({\n    key: tc.key,\n    name: tc.name,\n    objective: tc.objective\n  })),\n  missing_scenarios: firstItem.missing_scenarios || [],\n  new_testcases_created: newTestCasesCreated\n};\n\nreturn [{ json: finalOutput }];"
+        "jsCode": "// No critical gaps were found — existing tests provide adequate coverage.\n// Build a structured output so the final formatter has the same shape\n// as the new-tests-created path.\nconst data = $input.first().json;\n\nreturn [{\n  json: {\n    story: {\n      id: data.story_id,\n      summary: data.summary\n    },\n    coverage_summary: data.coverage_summary || {},\n    existing_testcases: (data.linked_testcases || []).map(tc => ({\n      key: tc.key,\n      name: tc.name,\n      objective: tc.objective\n    })),\n    missing_scenarios: [],\n    new_testcases_created: [],\n    duplicates_removed: (data.duplicate_groups || []).map(g => ({\n      kept: g.keep,\n      kept_name: g.keep_name,\n      deleted: g.duplicates.map(d => ({ key: d.key, name: d.name, similarity: d.similarity_score }))\n    })),\n    status: 'COVERAGE_ADEQUATE',\n    message: 'Existing test cases provide sufficient coverage. No new test cases were generated.'\n  }\n}];"
+      },
+      "id": "node-no-gaps-message",
+      "name": "No Gaps Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3300, 520]
+    },
+    {
+      "parameters": {
+        "mode": "append"
+      },
+      "id": "node-merge-before-final",
+      "name": "Merge Before Final",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [4400, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate all results into a single structured output.\n// Handles both paths:\n//   A) New test cases were created (status: NEW_TESTS_CREATED)\n//   B) Coverage was already adequate (status: COVERAGE_ADEQUATE)\nconst allItems = $input.all();\nconst firstItem = allItems[0]?.json || {};\n\n// Path B: No Gaps Message already built the full output\nif (firstItem.status === 'COVERAGE_ADEQUATE') {\n  return [{ json: firstItem }];\n}\n\n// Path A: Aggregate created test case keys/names\nconst newTestCasesCreated = allItems.map(item => ({\n  key: item.json.testcase_key || '',\n  name: item.json.testcase_name || ''\n})).filter(tc => tc.key);\n\nconst coverageData = $('Parse Coverage Analysis').first().json;\n\nreturn [{\n  json: {\n    story: {\n      id: coverageData.story_id || '',\n      summary: coverageData.summary || ''\n    },\n    coverage_summary: coverageData.coverage_summary || {},\n    existing_testcases: (coverageData.linked_testcases || []).map(tc => ({\n      key: tc.key,\n      name: tc.name,\n      objective: tc.objective\n    })),\n    missing_scenarios: coverageData.missing_scenarios || [],\n    new_testcases_created: newTestCasesCreated,\n    duplicates_removed: (coverageData.duplicate_groups || []).map(g => ({\n      kept: g.keep,\n      kept_name: g.keep_name,\n      deleted: g.duplicates.map(d => ({ key: d.key, name: d.name, similarity: d.similarity_score }))\n    })),\n    status: 'NEW_TESTS_CREATED'\n  }\n}];"
       },
       "id": "node-build-final-output",
       "name": "Build Final Output",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2860, 300]
+      "position": [4620, 300]
     },
     {
       "parameters": {
@@ -270,7 +419,7 @@
           "values": [
             {
               "role": "user",
-              "content": "=Format the following QA Test Design Agent results as a clear, human-readable summary for a QA engineer.\n\nData:\n{{JSON.stringify($json, null, 2)}}\n\nFormat as:\n1. Story overview (ID + summary)\n2. Existing test coverage summary (bullet points per category)\n3. Missing scenarios identified (numbered list with categories)\n4. New test cases created (list with keys and names)\n5. Overall assessment (1-2 sentences)\n\nUse clear headings. Be concise but complete."
+              "content": "=Format the following QA Test Design Agent results as a clear, human-readable summary for a QA engineer.\n\nData:\n{{JSON.stringify($json, null, 2)}}\n\nFormat as:\n1. **Story Overview** — ID + summary\n2. **Duplicate Test Cases Removed** — list each duplicate group (which was kept, which were deleted and why); if none, write \"None detected.\"\n3. **Existing Test Coverage** — bullet points per category (functional, edge cases, validations, negative scenarios)\n4. **Gaps Identified** — numbered list with category and risk level; if none, write \"None — coverage is adequate.\"\n5. **New Test Cases Created** — list each with its Zephyr key and name; if none, write \"None — existing coverage is sufficient.\"\n6. **Overall Assessment** — 1–2 sentences on the quality of the test suite.\n\nUse clear markdown headings. Be concise but complete."
             }
           ]
         },
@@ -283,7 +432,7 @@
       "name": "Format Response (Claude)",
       "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
       "typeVersion": 1.2,
-      "position": [3080, 300],
+      "position": [4840, 300],
       "credentials": {
         "anthropicApi": {
           "id": "anthropic-api-cred",
@@ -320,6 +469,37 @@
     },
     "Filter Linked Test Cases": {
       "main": [
+        [{ "node": "Detect Duplicates", "type": "main", "index": 0 }]
+      ]
+    },
+    "Detect Duplicates": {
+      "main": [
+        [{ "node": "IF Duplicates Exist", "type": "main", "index": 0 }]
+      ]
+    },
+    "IF Duplicates Exist": {
+      "main": [
+        [{ "node": "Extract Duplicate Keys", "type": "main", "index": 0 }],
+        [{ "node": "Merge After Dedup",      "type": "main", "index": 1 }]
+      ]
+    },
+    "Extract Duplicate Keys": {
+      "main": [
+        [{ "node": "Delete Duplicate Test Case", "type": "main", "index": 0 }]
+      ]
+    },
+    "Delete Duplicate Test Case": {
+      "main": [
+        [{ "node": "Restore Story After Delete", "type": "main", "index": 0 }]
+      ]
+    },
+    "Restore Story After Delete": {
+      "main": [
+        [{ "node": "Merge After Dedup", "type": "main", "index": 0 }]
+      ]
+    },
+    "Merge After Dedup": {
+      "main": [
         [{ "node": "Analyze Coverage (Claude)", "type": "main", "index": 0 }]
       ]
     },
@@ -330,7 +510,13 @@
     },
     "Parse Coverage Analysis": {
       "main": [
-        [{ "node": "Generate New Test Cases (Claude)", "type": "main", "index": 0 }]
+        [{ "node": "IF Gaps Found", "type": "main", "index": 0 }]
+      ]
+    },
+    "IF Gaps Found": {
+      "main": [
+        [{ "node": "Generate New Test Cases (Claude)", "type": "main", "index": 0 }],
+        [{ "node": "No Gaps Message",                 "type": "main", "index": 0 }]
       ]
     },
     "Generate New Test Cases (Claude)": {
@@ -355,6 +541,16 @@
     },
     "Link Test Case to Story": {
       "main": [
+        [{ "node": "Merge Before Final", "type": "main", "index": 0 }]
+      ]
+    },
+    "No Gaps Message": {
+      "main": [
+        [{ "node": "Merge Before Final", "type": "main", "index": 1 }]
+      ]
+    },
+    "Merge Before Final": {
+      "main": [
         [{ "node": "Build Final Output", "type": "main", "index": 0 }]
       ]
     },
@@ -375,5 +571,5 @@
   "tags": ["QA", "Test Design", "JIRA", "Zephyr", "Claude"],
   "triggerCount": 0,
   "updatedAt": "2026-03-12T00:00:00.000Z",
-  "versionId": "1"
+  "versionId": "2"
 }
