@@ -1,0 +1,379 @@
+{
+  "name": "QA Test Design Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "node-chat-trigger",
+      "name": "Chat Message Trigger",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 300],
+      "webhookId": "qa-test-design-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract story ID from chat message\nconst message = $input.first().json?.chatInput || $input.first().json?.message || '';\nconst storyId = message.trim().toUpperCase();\n\nif (!storyId || !/^[A-Z]+-\\d+$/.test(storyId)) {\n  throw new Error(`Invalid JIRA Story ID: '${storyId}'. Expected format: PROJECT-123`);\n}\n\nreturn [{ json: { story_id: storyId } }];"
+      },
+      "id": "node-extract-story-id",
+      "name": "Extract Story ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://{{$vars.JIRA_DOMAIN}}/rest/api/3/issue/{{$json.story_id}}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-fetch-jira-story",
+      "name": "Fetch JIRA Story",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 300],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "jira-basic-auth",
+          "name": "JIRA Basic Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse JIRA story response\nconst issue = $input.first().json;\n\nconst fields = issue.fields || {};\n\n// Extract description text from Atlassian Document Format (ADF)\nfunction extractText(adf) {\n  if (!adf) return '';\n  if (typeof adf === 'string') return adf;\n  let text = '';\n  if (adf.text) text += adf.text;\n  if (adf.content && Array.isArray(adf.content)) {\n    for (const node of adf.content) {\n      text += extractText(node);\n      if (['paragraph','heading','listItem','bulletList','orderedList'].includes(node.type)) {\n        text += '\\n';\n      }\n    }\n  }\n  return text;\n}\n\n// Extract acceptance criteria from description or custom field\nconst description = extractText(fields.description);\n\n// Try to find acceptance criteria section\nlet acceptanceCriteria = '';\nconst acMatch = description.match(/acceptance criteria[:\\s]+([\\s\\S]*?)(?=\\n#|$)/i);\nif (acMatch) {\n  acceptanceCriteria = acMatch[1].trim();\n}\n\n// Try custom field for acceptance criteria (common field IDs)\nconst customFields = ['customfield_10016', 'customfield_10014', 'customfield_10300'];\nfor (const cf of customFields) {\n  if (fields[cf]) {\n    const cfText = extractText(fields[cf]);\n    if (cfText) { acceptanceCriteria = cfText; break; }\n  }\n}\n\nreturn [{\n  json: {\n    story_id: issue.key,\n    issue_id: issue.id,\n    summary: fields.summary || '',\n    description: description,\n    acceptance_criteria: acceptanceCriteria,\n    issue_type: fields.issuetype?.name || '',\n    status: fields.status?.name || '',\n    priority: fields.priority?.name || ''\n  }\n}];"
+      },
+      "id": "node-parse-jira-story",
+      "name": "Parse JIRA Story",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://prod-api.zephyr4jiracloud.com/v2/testcases?projectKey={{$json.story_id.split('-')[0]}}&maxResults=200",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$vars.ZEPHYR_API_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-fetch-zephyr-testcases",
+      "name": "Fetch Zephyr Test Cases",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Filter test cases linked to the story\nconst zephyrResponse = $input.first().json;\nconst storyData = $('Parse JIRA Story').first().json;\n\nconst testCases = zephyrResponse.values || zephyrResponse.testCases || [];\nconst issueId = storyData.issue_id;\nconst storyKey = storyData.story_id;\n\nconst linkedTestCases = testCases.filter(tc => {\n  const links = tc.linkedIssues || tc.issueLinks || [];\n  return links.some(link => {\n    const id = link.issueId || link.id || '';\n    const key = link.issueKey || link.key || '';\n    return String(id) === String(issueId) || key === storyKey;\n  });\n});\n\nreturn [{\n  json: {\n    story_id: storyKey,\n    issue_id: issueId,\n    summary: storyData.summary,\n    description: storyData.description,\n    acceptance_criteria: storyData.acceptance_criteria,\n    all_testcases_count: testCases.length,\n    linked_testcases: linkedTestCases.map(tc => ({\n      key: tc.key || tc.testCaseKey || '',\n      name: tc.name || tc.title || '',\n      objective: tc.objective || '',\n      status: tc.status?.name || tc.statusName || '',\n      steps: (tc.testScript?.stepByStepScript?.steps ||\n              tc.steps || []).map(s => ({\n        description: s.description || '',\n        expectedResult: s.expectedResult || ''\n      }))\n    }))\n  }\n}];"
+      },
+      "id": "node-filter-linked-testcases",
+      "name": "Filter Linked Test Cases",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 300]
+    },
+    {
+      "parameters": {
+        "model": "claude-sonnet-4-6",
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "=You are a senior QA engineer. Analyze the following JIRA user story and its existing test cases, then perform two tasks.\n\n## JIRA Story\nStory ID: {{$json.story_id}}\nSummary: {{$json.summary}}\n\nDescription:\n{{$json.description}}\n\nAcceptance Criteria:\n{{$json.acceptance_criteria}}\n\n## Existing Test Cases ({{$json.linked_testcases.length}} linked)\n{{JSON.stringify($json.linked_testcases, null, 2)}}\n\n---\n\n## TASK 1 — Coverage Summary\nSummarize what is already covered by the existing test cases. Structure it as:\n- Functional scenarios covered\n- Edge cases covered\n- Validation checks covered\n- Negative scenarios covered\n\n## TASK 2 — Missing Scenarios\nIdentify ALL testing gaps. Consider:\n- Boundary conditions not tested\n- Negative / error paths not covered\n- Validation rules not verified\n- Error handling scenarios\n- Integration / end-to-end flows\n- Any acceptance criteria not covered by existing tests\n\nReturn your analysis as valid JSON only (no markdown fences, no extra text) in this exact structure:\n{\n  \"coverage_summary\": {\n    \"functional_scenarios\": [\"...\"],\n    \"edge_cases\": [\"...\"],\n    \"validation_checks\": [\"...\"],\n    \"negative_scenarios\": [\"...\"]\n  },\n  \"missing_scenarios\": [\n    {\n      \"title\": \"short title\",\n      \"description\": \"what needs to be tested and why it is missing\",\n      \"category\": \"boundary|negative|validation|error_handling|integration|functional\"\n    }\n  ]\n}"
+            }
+          ]
+        },
+        "options": {
+          "maxTokens": 4000,
+          "temperature": 0.2
+        }
+      },
+      "id": "node-analyze-coverage",
+      "name": "Analyze Coverage (Claude)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.2,
+      "position": [1320, 300],
+      "credentials": {
+        "anthropicApi": {
+          "id": "anthropic-api-cred",
+          "name": "Anthropic API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Claude's coverage analysis response\nconst claudeResponse = $input.first().json;\nconst filterData = $('Filter Linked Test Cases').first().json;\n\nlet analysisText = claudeResponse.text ||\n  claudeResponse.content?.[0]?.text ||\n  claudeResponse.message?.content?.[0]?.text ||\n  claudeResponse.output?.[0]?.text ||\n  JSON.stringify(claudeResponse);\n\n// Strip markdown code fences if present\nanalysisText = analysisText.replace(/```json\\s*/gi, '').replace(/```\\s*/g, '').trim();\n\nlet analysis;\ntry {\n  analysis = JSON.parse(analysisText);\n} catch (e) {\n  // Try to extract JSON from the text\n  const jsonMatch = analysisText.match(/\\{[\\s\\S]*\\}/);\n  if (jsonMatch) {\n    analysis = JSON.parse(jsonMatch[0]);\n  } else {\n    throw new Error('Failed to parse Claude coverage analysis: ' + analysisText.slice(0, 500));\n  }\n}\n\nreturn [{\n  json: {\n    ...filterData,\n    coverage_summary: analysis.coverage_summary || {},\n    missing_scenarios: analysis.missing_scenarios || []\n  }\n}];"
+      },
+      "id": "node-parse-coverage-analysis",
+      "name": "Parse Coverage Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 300]
+    },
+    {
+      "parameters": {
+        "model": "claude-sonnet-4-6",
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "=You are a senior QA engineer. Generate detailed, executable test cases for the missing scenarios identified below.\n\n## JIRA Story\nStory ID: {{$json.story_id}}\nSummary: {{$json.summary}}\n\nDescription:\n{{$json.description}}\n\nAcceptance Criteria:\n{{$json.acceptance_criteria}}\n\n## Missing Scenarios to Cover\n{{JSON.stringify($json.missing_scenarios, null, 2)}}\n\n## Existing Test Cases (DO NOT DUPLICATE)\n{{JSON.stringify($json.linked_testcases.map(tc => tc.name), null, 2)}}\n\n---\n\nGenerate one test case per missing scenario. Each test case must be thorough, with atomic steps and clear expected results.\n\nReturn ONLY valid JSON (no markdown fences, no extra text) as an array:\n[\n  {\n    \"name\": \"TC: <concise name describing what is tested>\",\n    \"objective\": \"<one sentence stating the goal of this test>\",\n    \"precondition\": \"<system state required before executing this test>\",\n    \"steps\": [\n      {\n        \"description\": \"<action to perform — be specific>\",\n        \"expectedResult\": \"<what the system should do/show>\"\n      }\n    ]\n  }\n]"
+            }
+          ]
+        },
+        "options": {
+          "maxTokens": 8000,
+          "temperature": 0.2
+        }
+      },
+      "id": "node-generate-testcases",
+      "name": "Generate New Test Cases (Claude)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.2,
+      "position": [1760, 300],
+      "credentials": {
+        "anthropicApi": {
+          "id": "anthropic-api-cred",
+          "name": "Anthropic API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse generated test cases from Claude\nconst claudeResponse = $input.first().json;\nconst coverageData = $('Parse Coverage Analysis').first().json;\n\nlet tcText = claudeResponse.text ||\n  claudeResponse.content?.[0]?.text ||\n  claudeResponse.message?.content?.[0]?.text ||\n  claudeResponse.output?.[0]?.text ||\n  JSON.stringify(claudeResponse);\n\n// Strip markdown code fences\ntcText = tcText.replace(/```json\\s*/gi, '').replace(/```\\s*/g, '').trim();\n\nlet newTestCases;\ntry {\n  newTestCases = JSON.parse(tcText);\n} catch (e) {\n  const jsonMatch = tcText.match(/\\[[\\s\\S]*\\]/);\n  if (jsonMatch) {\n    newTestCases = JSON.parse(jsonMatch[0]);\n  } else {\n    throw new Error('Failed to parse generated test cases: ' + tcText.slice(0, 500));\n  }\n}\n\nif (!Array.isArray(newTestCases)) {\n  newTestCases = [newTestCases];\n}\n\n// Store coverage data in a static field for downstream nodes\nconst projectKey = coverageData.story_id.split('-')[0];\n\nreturn newTestCases.map(tc => ({\n  json: {\n    testcase: tc,\n    story_id: coverageData.story_id,\n    issue_id: coverageData.issue_id,\n    project_key: projectKey,\n    coverage_summary: coverageData.coverage_summary,\n    missing_scenarios: coverageData.missing_scenarios,\n    linked_testcases: coverageData.linked_testcases,\n    summary: coverageData.summary\n  }\n}));"
+      },
+      "id": "node-parse-new-testcases",
+      "name": "Parse New Test Cases",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://prod-api.zephyr4jiracloud.com/v2/testcases",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$vars.ZEPHYR_API_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"projectKey\": \"{{$json.project_key}}\",\n  \"name\": \"{{$json.testcase.name}}\",\n  \"statusId\": 11845307,\n  \"priorityId\": 11845309,\n  \"owner\": \"712020:c78a4533-0f1d-4e10-9488-f3b4462447a8\",\n  \"objective\": \"{{$json.testcase.objective}}\",\n  \"precondition\": \"{{$json.testcase.precondition}}\",\n  \"estimatedTime\": 3600000,\n  \"testScript\": {\n    \"stepByStepScript\": {\n      \"steps\": {{JSON.stringify($json.testcase.steps.map((s, i) => ({ description: s.description, expectedResult: s.expectedResult, index: i })))}}\n    }\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-create-zephyr-testcase",
+      "name": "Create Zephyr Test Case",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2200, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract the created test case key from Zephyr response\nconst zephyrResponse = $input.first().json;\nconst inputData = $('Parse New Test Cases').first().json;\n\nconst testcaseKey = zephyrResponse.key ||\n  zephyrResponse.testCaseKey ||\n  zephyrResponse.id ||\n  zephyrResponse.testCase?.key;\n\nif (!testcaseKey) {\n  throw new Error('Could not extract testcase key from Zephyr response: ' + JSON.stringify(zephyrResponse).slice(0, 300));\n}\n\nreturn [{\n  json: {\n    testcase_key: testcaseKey,\n    testcase_name: inputData.testcase?.name || '',\n    issue_id: inputData.issue_id,\n    story_id: inputData.story_id,\n    project_key: inputData.project_key,\n    coverage_summary: inputData.coverage_summary,\n    missing_scenarios: inputData.missing_scenarios,\n    linked_testcases: inputData.linked_testcases,\n    summary: inputData.summary\n  }\n}];"
+      },
+      "id": "node-extract-testcase-key",
+      "name": "Extract Test Case Key",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2420, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://prod-api.zephyr4jiracloud.com/v2/testcases/{{$json.testcase_key}}/links/issues",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$vars.ZEPHYR_API_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"issueId\": \"{{$json.issue_id}}\"\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-link-testcase-to-story",
+      "name": "Link Test Case to Story",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2640, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate all results for final output\nconst allItems = $input.all();\n\n// Get stable data from the first item (all items share story context)\nconst firstItem = allItems[0]?.json || {};\nconst linked = $('Extract Test Case Key').all() || [];\n\nconst newTestCasesCreated = linked.map(item => ({\n  key: item.json.testcase_key,\n  name: item.json.testcase_name\n}));\n\n// Build final structured output\nconst finalOutput = {\n  story: {\n    id: firstItem.story_id || '',\n    summary: firstItem.summary || ''\n  },\n  coverage_summary: firstItem.coverage_summary || {},\n  existing_testcases: (firstItem.linked_testcases || []).map(tc => ({\n    key: tc.key,\n    name: tc.name,\n    objective: tc.objective\n  })),\n  missing_scenarios: firstItem.missing_scenarios || [],\n  new_testcases_created: newTestCasesCreated\n};\n\nreturn [{ json: finalOutput }];"
+      },
+      "id": "node-build-final-output",
+      "name": "Build Final Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2860, 300]
+    },
+    {
+      "parameters": {
+        "model": "claude-sonnet-4-6",
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "=Format the following QA Test Design Agent results as a clear, human-readable summary for a QA engineer.\n\nData:\n{{JSON.stringify($json, null, 2)}}\n\nFormat as:\n1. Story overview (ID + summary)\n2. Existing test coverage summary (bullet points per category)\n3. Missing scenarios identified (numbered list with categories)\n4. New test cases created (list with keys and names)\n5. Overall assessment (1-2 sentences)\n\nUse clear headings. Be concise but complete."
+            }
+          ]
+        },
+        "options": {
+          "maxTokens": 2000,
+          "temperature": 0.3
+        }
+      },
+      "id": "node-format-response",
+      "name": "Format Response (Claude)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.2,
+      "position": [3080, 300],
+      "credentials": {
+        "anthropicApi": {
+          "id": "anthropic-api-cred",
+          "name": "Anthropic API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Chat Message Trigger": {
+      "main": [
+        [{ "node": "Extract Story ID", "type": "main", "index": 0 }]
+      ]
+    },
+    "Extract Story ID": {
+      "main": [
+        [{ "node": "Fetch JIRA Story", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch JIRA Story": {
+      "main": [
+        [{ "node": "Parse JIRA Story", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse JIRA Story": {
+      "main": [
+        [{ "node": "Fetch Zephyr Test Cases", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Zephyr Test Cases": {
+      "main": [
+        [{ "node": "Filter Linked Test Cases", "type": "main", "index": 0 }]
+      ]
+    },
+    "Filter Linked Test Cases": {
+      "main": [
+        [{ "node": "Analyze Coverage (Claude)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Analyze Coverage (Claude)": {
+      "main": [
+        [{ "node": "Parse Coverage Analysis", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Coverage Analysis": {
+      "main": [
+        [{ "node": "Generate New Test Cases (Claude)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Generate New Test Cases (Claude)": {
+      "main": [
+        [{ "node": "Parse New Test Cases", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse New Test Cases": {
+      "main": [
+        [{ "node": "Create Zephyr Test Case", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Zephyr Test Case": {
+      "main": [
+        [{ "node": "Extract Test Case Key", "type": "main", "index": 0 }]
+      ]
+    },
+    "Extract Test Case Key": {
+      "main": [
+        [{ "node": "Link Test Case to Story", "type": "main", "index": 0 }]
+      ]
+    },
+    "Link Test Case to Story": {
+      "main": [
+        [{ "node": "Build Final Output", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Final Output": {
+      "main": [
+        [{ "node": "Format Response (Claude)", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["QA", "Test Design", "JIRA", "Zephyr", "Claude"],
+  "triggerCount": 0,
+  "updatedAt": "2026-03-12T00:00:00.000Z",
+  "versionId": "1"
+}
