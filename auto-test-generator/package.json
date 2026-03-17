@@ -1,0 +1,15 @@
+{
+  "name": "auto-test-generator",
+  "version": "1.0.0",
+  "description": "Reads Swagger/OpenAPI spec and automatically generates + executes all test cases — no manual HTTP nodes",
+  "main": "index.js",
+  "scripts": {
+    "test": "node index.js",
+    "test:verbose": "VERBOSE=true node index.js",
+    "test:report": "node index.js --report=json"
+  },
+  "dependencies": {
+    "axios": "^1.6.5",
+    "chalk": "^4.1.2"
+  }
+}

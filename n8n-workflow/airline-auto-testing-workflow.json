@@ -1,0 +1,437 @@
+{
+  "name": "Airline API — Auto Test Generator & Runner",
+  "nodes": [
+
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "0 */6 * * *" }] }
+      },
+      "id": "n01_trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 400],
+      "notes": "Runs every 6 hours. Can also be triggered manually."
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.AIRLINE_BASE_URL || 'http://localhost:3000' }}/api/auth/login",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "email": "={{ $vars.AIRLINE_USER || 'admin@skyline.com' }}",
+          "password": "={{ $vars.AIRLINE_PASS || 'Admin@1234' }}"
+        },
+        "options": { "timeout": 10000 }
+      },
+      "id": "n02_login",
+      "name": "Login — Get Tokens",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [420, 400],
+      "notes": "POST /api/auth/login → accessToken (15min) + refreshToken (7d)"
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nif (!data.accessToken) throw new Error('Login failed: ' + JSON.stringify(data));\nreturn [{ json: {\n  accessToken: data.accessToken,\n  refreshToken: data.refreshToken,\n  expiresIn: data.expiresIn,\n  runId: 'RUN-' + Date.now(),\n  runStart: Date.now()\n}}];"
+      },
+      "id": "n03_store_tokens",
+      "name": "Store Tokens",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 400]
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $vars.AIRLINE_BASE_URL || 'http://localhost:3000' }}/api/openapi.json",
+        "options": { "timeout": 10000 }
+      },
+      "id": "n04_fetch_spec",
+      "name": "Fetch OpenAPI Spec",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [860, 400],
+      "notes": "Pulls the live Swagger JSON — this drives ALL test generation. No endpoints are hardcoded."
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// ───────────────────────────────────────────────────────────────────────────\n// PHASE A: Parse spec\n// ───────────────────────────────────────────────────────────────────────────\nconst spec = $input.first().json;\nconst BASE_URL = $vars.AIRLINE_BASE_URL || 'http://localhost:3000';\nconst DEFAULT_SLA = 2000;\n\n// Resolve $ref in the spec\nfunction resolveRef(ref, s) {\n  if (!ref || !ref.startsWith('#/')) return null;\n  return ref.replace('#/', '').split('/').reduce((o, k) => o?.[k], s);\n}\nfunction deref(schema, s, depth = 0) {\n  if (!schema || depth > 5) return schema || {};\n  if (schema.$ref) return deref(resolveRef(schema.$ref, s), s, depth + 1);\n  if (schema.allOf) return schema.allOf.reduce((m, x) => ({ ...m, ...deref(x, s, depth + 1) }), {});\n  if (schema.oneOf || schema.anyOf) return deref((schema.oneOf || schema.anyOf)[0], s, depth + 1);\n  if (schema.properties) {\n    const props = {};\n    for (const [k, v] of Object.entries(schema.properties)) props[k] = deref(v, s, depth + 1);\n    return { ...schema, properties: props };\n  }\n  return schema;\n}\n\n// ───────────────────────────────────────────────────────────────────────────\n// PHASE B: Generate a valid (positive) value from a schema node\n// ───────────────────────────────────────────────────────────────────────────\nfunction positiveVal(schema, name = '') {\n  if (!schema) return 'value';\n  if (schema.example !== undefined) return schema.example;\n  switch (schema.type) {\n    case 'integer': case 'number': {\n      const mn = schema.minimum ?? 1, mx = schema.maximum ?? 99;\n      return Math.round((mn + mx) / 2);\n    }\n    case 'boolean': return true;\n    case 'array':   return [positiveVal(schema.items || { type: 'string' })];\n    case 'object': {\n      const o = {};\n      for (const [k, v] of Object.entries(schema.properties || {})) o[k] = positiveVal(v, k);\n      return o;\n    }\n    default: {\n      if (schema.enum?.length) return schema.enum[0];\n      if (schema.format === 'email')     return `test_${name || 'user'}@airline-test.com`;\n      if (schema.format === 'date')      return '2024-08-15';\n      if (schema.format === 'date-time') return '2024-08-15T08:00:00Z';\n      const len = Math.min(Math.max(schema.minLength || 1, 6), schema.maxLength || 20);\n      return (name || 'value').substring(0, len).padEnd(len, 'x');\n    }\n  }\n}\n\nfunction buildBody(bodySchema) {\n  if (!bodySchema || (bodySchema.type !== 'object' && !bodySchema.properties)) return null;\n  const b = {};\n  for (const [k, v] of Object.entries(bodySchema.properties || {})) b[k] = positiveVal(v, k);\n  return b;\n}\n\nfunction fillPath(path, vals) {\n  return path.replace(/\\{(\\w+)\\}/g, (_, n) => encodeURIComponent(vals[n] || `TEST_${n}`));\n}\n\n// Sensible airline ID seeds for path params\nconst PATH_SEEDS = { id: 'FL001', flightId: 'FL001', code: 'JFK', bookingId: 'BK001', passengerId: 'P001' };\n\n// ───────────────────────────────────────────────────────────────────────────\n// PHASE C: Generate test cases for every endpoint\n// ───────────────────────────────────────────────────────────────────────────\nconst globalAuth = !!(spec.security?.length);\nconst testCases = [];\n\nfor (const [path, pathItem] of Object.entries(spec.paths || {})) {\n  for (const [method, op] of Object.entries(pathItem)) {\n    if (!['get','post','put','patch','delete'].includes(method)) continue;\n\n    const requiresAuth = Object.prototype.hasOwnProperty.call(op, 'security')\n      ? op.security?.length > 0\n      : globalAuth;\n\n    // Extract params\n    const allParams = op.parameters || [];\n    const pathParamNames = (path.match(/\\{(\\w+)\\}/g) || []).map(m => m.slice(1, -1));\n    const queryParams = allParams.filter(p => p.in === 'query');\n\n    // Path param values\n    const pathVals = {};\n    for (const n of pathParamNames) pathVals[n] = PATH_SEEDS[n] || `TEST_${n}`;\n\n    // Query param values (positive)\n    const positiveQuery = {};\n    for (const p of queryParams) positiveQuery[p.name] = p.example ?? positiveVal(deref(p.schema || {}, spec), p.name);\n    if (path.includes('/flights/search')) {\n      positiveQuery.origin = positiveQuery.origin || 'JFK';\n      positiveQuery.destination = positiveQuery.destination || 'LHR';\n      positiveQuery.date = positiveQuery.date || '2024-08-15';\n    }\n\n    // Body schema\n    const rawBodySchema = op.requestBody?.content?.['application/json']?.schema;\n    const bodySchema = rawBodySchema ? deref(rawBodySchema, spec) : null;\n    const positiveBody = buildBody(bodySchema);\n\n    const resolvedUrl = BASE_URL + fillPath(path, pathVals);\n    const positiveStatus = Object.keys(op.responses || {}).map(Number).find(c => c >= 200 && c < 300) || 200;\n    const AUTH = { Authorization: 'Bearer __ACCESS_TOKEN__' };\n    const tag = `${method.toUpperCase()} ${path}`;\n\n    function tc(overrides) {\n      return {\n        method: method.toUpperCase(), url: resolvedUrl,\n        headers: requiresAuth ? AUTH : {},\n        queryParams: positiveQuery,\n        body: positiveBody,\n        expectedStatus: positiveStatus,\n        slaMs: DEFAULT_SLA,\n        requiresAuth, type: 'positive', tag, ...overrides\n      };\n    }\n\n    // 1. Positive\n    testCases.push(tc({ id: `${tag}_positive`, type: 'positive', description: `[+] ${op.summary || tag}` }));\n\n    // 2. Missing required body fields\n    for (const f of bodySchema?.required || []) {\n      const b = { ...positiveBody }; delete b[f];\n      testCases.push(tc({ id: `${tag}_neg_missing_${f}`, type: 'negative', body: b, expectedStatus: 400, description: `[-] Missing '${f}' → 400` }));\n    }\n\n    // 3. Wrong type on first required field\n    if (bodySchema?.required?.[0] && positiveBody) {\n      const f = bodySchema.required[0];\n      const wrongVal = bodySchema.properties?.[f]?.type === 'string' ? 99999 : null;\n      testCases.push(tc({ id: `${tag}_neg_wrongtype_${f}`, type: 'negative', body: { ...positiveBody, [f]: wrongVal }, expectedStatus: 400, description: `[-] Wrong type for '${f}' → 400` }));\n    }\n\n    // 4. Boundary: string below minLength\n    for (const [f, fs] of Object.entries(bodySchema?.properties || {}).filter(([, s]) => s.type === 'string' && s.minLength > 0).slice(0, 2)) {\n      testCases.push(tc({ id: `${tag}_boundary_minLen_${f}`, type: 'boundary', body: { ...positiveBody, [f]: 'x'.repeat(Math.max(0, fs.minLength - 1)) }, expectedStatus: 400, description: `[B] '${f}' below minLength(${fs.minLength}) → 400` }));\n      if (fs.maxLength) testCases.push(tc({ id: `${tag}_boundary_maxLen_${f}`, type: 'boundary', body: { ...positiveBody, [f]: 'x'.repeat(fs.maxLength + 1) }, expectedStatus: 400, description: `[B] '${f}' above maxLength(${fs.maxLength}) → 400` }));\n    }\n\n    // 5. Invalid path param → 404\n    if (pathParamNames.length > 0) {\n      const badVals = { ...pathVals, [pathParamNames[0]]: 'INVALID_XYZ_999' };\n      testCases.push(tc({ id: `${tag}_neg_invalid_id`, type: 'negative', url: BASE_URL + fillPath(path, badVals), expectedStatus: 404, description: `[-] Invalid '${pathParamNames[0]}' → 404` }));\n    }\n\n    // 6. Missing required query params → 400\n    if (queryParams.some(p => p.required)) {\n      testCases.push(tc({ id: `${tag}_neg_missing_queryparam`, type: 'negative', queryParams: {}, expectedStatus: 400, description: `[-] Missing required query params → 400` }));\n    }\n\n    // 7. Auth: no token → 401\n    if (requiresAuth) {\n      testCases.push(tc({ id: `${tag}_auth_no_token`, type: 'auth', headers: {}, expectedStatus: 401, description: `[A] No token → 401` }));\n      // 8. Auth: bad token → 403\n      testCases.push(tc({ id: `${tag}_auth_bad_token`, type: 'auth', headers: { Authorization: 'Bearer invalid.jwt.garbage' }, expectedStatus: 403, description: `[A] Invalid JWT → 403` }));\n    }\n  }\n}\n\nconst runId = $('Store Tokens').first().json.runId;\nreturn [{ json: { testCases, total: testCases.length, runId, generatedAt: new Date().toISOString() } }];"
+      },
+      "id": "n05_generate_cases",
+      "name": "Parse Spec + Generate All Test Cases",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 400],
+      "notes": "Reads the OpenAPI spec and auto-generates positive/negative/boundary/auth test cases for EVERY endpoint. No endpoints hardcoded."
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Split the testCases array into individual items for the loop\nconst { testCases, total, runId, generatedAt } = $input.first().json;\nreturn testCases.map(tc => ({ json: { ...tc, _total: total, _runId: runId } }));"
+      },
+      "id": "n06_split_cases",
+      "name": "Split Into Individual Test Cases",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 400],
+      "notes": "Converts the testCases array into separate n8n items — one per test case — for the loop."
+    },
+
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "n07_loop",
+      "name": "Loop: One Test Case at a Time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1520, 400],
+      "notes": "Processes test cases one by one. Batch size = 1 ensures sequential execution and allows token refresh between calls."
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Inject live access token into the Authorization header\nconst tc = $input.first().json;\nconst accessToken = $('Store Tokens').first().json.accessToken;\n\nconst headers = {};\nfor (const [k, v] of Object.entries(tc.headers || {})) {\n  headers[k] = typeof v === 'string' ? v.replace('__ACCESS_TOKEN__', accessToken) : v;\n}\n\nreturn [{ json: { ...tc, headers, _accessToken: accessToken } }];"
+      },
+      "id": "n08_inject_token",
+      "name": "Inject Access Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1740, 300],
+      "notes": "Replaces __ACCESS_TOKEN__ placeholder with the live JWT before each request. Picks up refreshed tokens automatically."
+    },
+
+    {
+      "parameters": {
+        "method": "={{ $json.method }}",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $json.headers['Authorization'] || '' }}"
+            }
+          ]
+        },
+        "sendQuery": "={{ Object.keys($json.queryParams || {}).length > 0 }}",
+        "queryParameters": {
+          "parameters": "={{ Object.entries($json.queryParams || {}).map(([name,value]) => ({name, value})) }}"
+        },
+        "sendBody": "={{ $json.body !== null && $json.body !== undefined }}",
+        "contentType": "json",
+        "body": "={{ $json.body }}",
+        "options": {
+          "timeout": 8000,
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "n09_execute_request",
+      "name": "Execute HTTP Request (Dynamic)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1960, 300],
+      "continueOnFail": true,
+      "notes": "THE only HTTP node in the entire workflow. Method, URL, headers, query params, and body are all injected dynamically from the test case. Works for every endpoint automatically."
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Validate the response against the expected status and SLA\nconst tc = $('Inject Access Token').first().json;\nconst response = $input.first().json;\n\n// n8n fullResponse gives: { status, headers, body }\nconst actualStatus = response.statusCode ?? response.status ?? null;\nconst responseBody = response.body ?? response;\nconst responseTimeMs = response.headers?.['x-response-time']\n  ? parseInt(response.headers['x-response-time'])\n  : (tc._responseTimeMs || 0);\n\nconst slaViolated = responseTimeMs > tc.slaMs;\nconst passed = actualStatus === tc.expectedStatus;\n\nreturn [{ json: {\n  testId: tc.id,\n  type: tc.type,\n  tag: tc.tag,\n  description: tc.description,\n  method: tc.method,\n  url: tc.url,\n  expectedStatus: tc.expectedStatus,\n  actualStatus,\n  passed,\n  slaViolated,\n  responseTimeMs,\n  _runId: tc._runId,\n  _total: tc._total,\n  body: typeof responseBody === 'object' ? responseBody : { raw: responseBody }\n}}];"
+      },
+      "id": "n10_validate_response",
+      "name": "Validate Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2180, 300],
+      "notes": "Checks: (1) HTTP status == expectedStatus, (2) SLA not exceeded. Marks passed/failed without throwing."
+    },
+
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ !$json.passed && $json.actualStatus === 401 && $json.type !== 'auth' }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "n11_check_401",
+      "name": "Unexpected 401? (Token Expired)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2400, 300],
+      "notes": "Detects an unexpected 401 on non-auth test cases — means the access token expired. Routes to token refresh."
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.AIRLINE_BASE_URL || 'http://localhost:3000' }}/api/auth/refresh",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "refreshToken": "={{ $('Store Tokens').first().json.refreshToken }}"
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "n12_refresh_token",
+      "name": "Refresh Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2620, 180],
+      "notes": "POST /api/auth/refresh — rotates both access and refresh tokens. Triggered automatically on unexpected 401."
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Update the stored token state with fresh tokens\nconst refreshData = $input.first().json;\nif (!refreshData.accessToken) throw new Error('Token refresh failed: ' + JSON.stringify(refreshData));\n\n// Mutate the Store Tokens node's output (n8n: write to static data)\n$('Store Tokens').first().json.accessToken = refreshData.accessToken;\n$('Store Tokens').first().json.refreshToken = refreshData.refreshToken;\n\nreturn [{ json: { refreshed: true, newAccessToken: refreshData.accessToken } }];"
+      },
+      "id": "n13_update_tokens",
+      "name": "Update Token State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2840, 180]
+    },
+
+    {
+      "parameters": {
+        "mode": "passThrough",
+        "output": "input1"
+      },
+      "id": "n14_merge_after_refresh",
+      "name": "Merge (Continue Loop)",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2,
+      "position": [3060, 300],
+      "notes": "Merges the normal path and post-refresh path back together to continue the loop."
+    },
+
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByIndex",
+        "options": {}
+      },
+      "id": "n15_aggregate",
+      "name": "Aggregate All Results",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2,
+      "position": [3280, 400],
+      "notes": "Waits for all test cases to finish, then passes the full results array to the reporter."
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Build the final test report from all collected results\nconst allResults = $input.all().map(item => item.json);\n\nconst total = allResults.length;\nconst passed = allResults.filter(r => r.passed);\nconst failed = allResults.filter(r => !r.passed);\nconst slaVio = allResults.filter(r => r.slaViolated);\nconst passRate = total ? Math.round((passed.length / total) * 100) : 0;\n\nconst byType = allResults.reduce((acc, r) => {\n  acc[r.type] = acc[r.type] || { pass: 0, fail: 0 };\n  r.passed ? acc[r.type].pass++ : acc[r.type].fail++;\n  return acc;\n}, {});\n\nconst byEndpoint = allResults.reduce((acc, r) => {\n  acc[r.tag] = acc[r.tag] || { pass: 0, fail: 0 };\n  r.passed ? acc[r.tag].pass++ : acc[r.tag].fail++;\n  return acc;\n}, {});\n\nconst runId = allResults[0]?._runId || 'UNKNOWN';\n\nconst summary = {\n  runId,\n  completedAt: new Date().toISOString(),\n  total,\n  passed: passed.length,\n  failed: failed.length,\n  slaViolations: slaVio.length,\n  passRate: passRate + '%',\n  overallStatus: failed.length === 0 ? 'SUCCESS' : 'FAILURE',\n  byType,\n  byEndpoint\n};\n\nconst failedDetails = failed.map(r => ({\n  testId: r.testId,\n  description: r.description,\n  endpoint: `${r.method} ${r.url}`,\n  expectedStatus: r.expectedStatus,\n  actualStatus: r.actualStatus,\n  slaViolated: r.slaViolated\n}));\n\nreturn [{ json: { summary, failedDetails, allResults, hasFailures: failed.length > 0 } }];"
+      },
+      "id": "n16_report",
+      "name": "Generate Test Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3500, 400],
+      "notes": "Computes pass rate, SLA violations, breakdown by test type and endpoint. Feeds into Jira/Slack nodes."
+    },
+
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.hasFailures }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "n17_if_failures",
+      "name": "Any Failures?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [3720, 400]
+    },
+
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert airline API QA analyst. Classify API test failures with precision."
+            },
+            {
+              "role": "user",
+              "content": "=Analyse these airline API test failures:\n\n{{ JSON.stringify($json.failedDetails, null, 2) }}\n\nFor each failure classify into:\n- CONTRACT_BREACH: schema/contract violation\n- AUTH_FAILURE: authentication/authorization bug\n- ENVIRONMENT_ISSUE: infra/network/config problem\n- LOGIC_ERROR: business logic bug\n- SLA_VIOLATION: response time exceeded\n\nReturn JSON array: [{ testId, classification, severity (P1/P2/P3), rootCause, suggestedFix }]"
+            }
+          ]
+        },
+        "options": { "temperature": 0.1 }
+      },
+      "id": "n18_ai_rootcause",
+      "name": "AI: Root Cause Classification",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [3940, 220],
+      "notes": "GPT-4o classifies each failure: CONTRACT_BREACH / AUTH_FAILURE / ENVIRONMENT_ISSUE / LOGIC_ERROR / SLA_VIOLATION"
+    },
+
+    {
+      "parameters": {
+        "domain": "your-org.atlassian.net",
+        "resource": "issue",
+        "operation": "create",
+        "projectKey": "AIR",
+        "summary": "=[AUTO-TEST FAILURE] {{ $('Generate Test Report').first().json.summary.runId }} — {{ $('Generate Test Report').first().json.summary.failed }} test(s) failed ({{ $('Generate Test Report').first().json.summary.passRate }} pass rate)",
+        "issueType": "Bug",
+        "description": "=**Test Run:** {{ $('Generate Test Report').first().json.summary.runId }}\n**Completed:** {{ $('Generate Test Report').first().json.summary.completedAt }}\n**Pass Rate:** {{ $('Generate Test Report').first().json.summary.passRate }}\n**Total Tests:** {{ $('Generate Test Report').first().json.summary.total }}\n**SLA Violations:** {{ $('Generate Test Report').first().json.summary.slaViolations }}\n\n---\n**Failed Tests:**\n{{ $('Generate Test Report').first().json.failedDetails.map(f => `• ${f.description}\\n  Expected: ${f.expectedStatus}, Got: ${f.actualStatus}`).join('\\n') }}\n\n---\n**AI Root Cause Analysis:**\n{{ $json.message?.content || 'N/A' }}\n\n_Auto-generated by n8n Airline API Testing Pipeline_",
+        "priority": "=High",
+        "labels": ["api-testing", "airline", "automated-qa", "auto-generated"]
+      },
+      "id": "n19_jira",
+      "name": "Create Jira Issue",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [4160, 220],
+      "notes": "Auto-creates a Jira bug with full diagnostics + AI root cause. Only fires on test failures."
+    },
+
+    {
+      "parameters": {
+        "channel": "#airline-api-alerts",
+        "text": "=:rotating_light: *Airline API Auto-Test: FAILURE*\n\n*Run ID:* `{{ $('Generate Test Report').first().json.summary.runId }}`\n*Pass Rate:* {{ $('Generate Test Report').first().json.summary.passRate }} ({{ $('Generate Test Report').first().json.summary.passed }}/{{ $('Generate Test Report').first().json.summary.total }} tests)\n*SLA Violations:* {{ $('Generate Test Report').first().json.summary.slaViolations }}\n\n*Failed Tests:*\n{{ $('Generate Test Report').first().json.failedDetails.map(f => `• ${f.description}`).join('\\n') }}\n\n*Jira:* {{ $json.key ? `https://your-org.atlassian.net/browse/${$json.key}` : 'Check Jira' }}"
+      },
+      "id": "n20_slack_fail",
+      "name": "Slack Alert (Failure)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [4380, 220]
+    },
+
+    {
+      "parameters": {
+        "channel": "#airline-api-alerts",
+        "text": "=:white_check_mark: *Airline API Auto-Test: ALL PASSED*\n\n*Run ID:* `{{ $json.summary.runId }}`\n*Tests:* {{ $json.summary.total }} auto-generated cases\n*Pass Rate:* {{ $json.summary.passRate }}\n*SLA Violations:* {{ $json.summary.slaViolations }}\n*Completed:* {{ $json.summary.completedAt }}"
+      },
+      "id": "n21_slack_pass",
+      "name": "Slack Notify (All Passed)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [3940, 580]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.AIRLINE_BASE_URL || 'http://localhost:3000' }}/api/auth/logout",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Store Tokens').first().json.accessToken }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "refreshToken": "={{ $('Store Tokens').first().json.refreshToken }}"
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "n22_logout",
+      "name": "Logout & Revoke Tokens",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [4600, 400],
+      "notes": "POST /api/auth/logout — revokes the refresh token so it cannot be reused."
+    }
+
+  ],
+
+  "connections": {
+    "Schedule Trigger":                  { "main": [[{ "node": "Login — Get Tokens",                 "type": "main", "index": 0 }]] },
+    "Login — Get Tokens":                { "main": [[{ "node": "Store Tokens",                        "type": "main", "index": 0 }]] },
+    "Store Tokens":                      { "main": [[{ "node": "Fetch OpenAPI Spec",                  "type": "main", "index": 0 }]] },
+    "Fetch OpenAPI Spec":                { "main": [[{ "node": "Parse Spec + Generate All Test Cases", "type": "main", "index": 0 }]] },
+    "Parse Spec + Generate All Test Cases": { "main": [[{ "node": "Split Into Individual Test Cases", "type": "main", "index": 0 }]] },
+    "Split Into Individual Test Cases":  { "main": [[{ "node": "Loop: One Test Case at a Time",       "type": "main", "index": 0 }]] },
+    "Loop: One Test Case at a Time": {
+      "main": [
+        [{ "node": "Inject Access Token",   "type": "main", "index": 0 }],
+        [{ "node": "Aggregate All Results", "type": "main", "index": 0 }]
+      ]
+    },
+    "Inject Access Token":               { "main": [[{ "node": "Execute HTTP Request (Dynamic)",      "type": "main", "index": 0 }]] },
+    "Execute HTTP Request (Dynamic)":    { "main": [[{ "node": "Validate Response",                   "type": "main", "index": 0 }]] },
+    "Validate Response":                 { "main": [[{ "node": "Unexpected 401? (Token Expired)",     "type": "main", "index": 0 }]] },
+    "Unexpected 401? (Token Expired)": {
+      "main": [
+        [{ "node": "Refresh Token",         "type": "main", "index": 0 }],
+        [{ "node": "Merge (Continue Loop)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Refresh Token":                     { "main": [[{ "node": "Update Token State",                  "type": "main", "index": 0 }]] },
+    "Update Token State":                { "main": [[{ "node": "Merge (Continue Loop)",               "type": "main", "index": 0 }]] },
+    "Merge (Continue Loop)":             { "main": [[{ "node": "Loop: One Test Case at a Time",       "type": "main", "index": 0 }]] },
+    "Aggregate All Results":             { "main": [[{ "node": "Generate Test Report",                "type": "main", "index": 0 }]] },
+    "Generate Test Report":              { "main": [[{ "node": "Any Failures?",                       "type": "main", "index": 0 }]] },
+    "Any Failures?": {
+      "main": [
+        [{ "node": "AI: Root Cause Classification", "type": "main", "index": 0 }],
+        [{ "node": "Slack Notify (All Passed)",      "type": "main", "index": 0 }]
+      ]
+    },
+    "AI: Root Cause Classification":     { "main": [[{ "node": "Create Jira Issue",                  "type": "main", "index": 0 }]] },
+    "Create Jira Issue":                 { "main": [[{ "node": "Slack Alert (Failure)",               "type": "main", "index": 0 }]] },
+    "Slack Alert (Failure)":             { "main": [[{ "node": "Logout & Revoke Tokens",             "type": "main", "index": 0 }]] },
+    "Slack Notify (All Passed)":         { "main": [[{ "node": "Logout & Revoke Tokens",             "type": "main", "index": 0 }]] }
+  },
+
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+
+  "_architecture": {
+    "keyDesign": "Single dynamic HTTP Request node (n09) executes ALL test cases. Method, URL, headers, body and query params are injected from the test case object at runtime.",
+    "autoGeneration": "The Code node n05 reads the OpenAPI spec and generates positive/negative/boundary/auth test cases for EVERY endpoint — no manual configuration per endpoint.",
+    "tokenRotation": "Access token is auto-refreshed mid-loop when an unexpected 401 is detected. Auth-type test cases that intentionally expect 401/403 are excluded from this logic.",
+    "nodes": {
+      "n01": "Schedule Trigger — runs every 6h",
+      "n02": "Login → JWT tokens",
+      "n03": "Store tokens in workflow state",
+      "n04": "Fetch OpenAPI spec live from server",
+      "n05": "Parse spec + auto-generate ALL test cases (positive/negative/boundary/auth)",
+      "n06": "Split array into individual n8n items",
+      "n07": "SplitInBatches loop (batch=1, sequential)",
+      "n08": "Inject live access token into headers",
+      "n09": "Execute HTTP request — DYNAMIC (single node for all 15 endpoints)",
+      "n10": "Validate: check status code + SLA",
+      "n11": "IF: unexpected 401?",
+      "n12": "Refresh token → new access + refresh tokens",
+      "n13": "Update token state for next iteration",
+      "n14": "Merge back into loop",
+      "n15": "Aggregate all results after loop ends",
+      "n16": "Generate full test report",
+      "n17": "IF: any failures?",
+      "n18": "AI (GPT-4o): root cause classification",
+      "n19": "Jira: auto-create bug with diagnostics",
+      "n20": "Slack: failure alert with Jira link",
+      "n21": "Slack: success notification",
+      "n22": "Logout: revoke refresh token"
+    }
+  }
+}
