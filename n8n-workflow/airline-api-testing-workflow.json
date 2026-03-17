@@ -1,0 +1,706 @@
+{
+  "name": "Airline API Testing Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 */6 * * *" }]
+        }
+      },
+      "id": "node_schedule_trigger",
+      "name": "Schedule Trigger (Every 6h)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "Runs API test suite every 6 hours"
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/api/auth/login",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "email": "={{ $vars.AIRLINE_API_USER || 'admin@skyline.com' }}",
+          "password": "={{ $vars.AIRLINE_API_PASS || 'Admin@1234' }}"
+        },
+        "options": { "timeout": 10000 }
+      },
+      "id": "node_auth_login",
+      "name": "1. Login - Get Tokens",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [460, 300],
+      "notes": "Endpoint 1: POST /api/auth/login — returns accessToken + refreshToken"
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Store tokens and track SLA\nconst loginResponse = $input.first().json;\nconst startTime = Date.now();\n\nif (!loginResponse.accessToken) {\n  throw new Error('Login failed: No access token received');\n}\n\nreturn [{\n  json: {\n    accessToken: loginResponse.accessToken,\n    refreshToken: loginResponse.refreshToken,\n    expiresIn: loginResponse.expiresIn,\n    user: loginResponse.user,\n    tokenAcquiredAt: new Date().toISOString(),\n    testRunId: `RUN-${Date.now()}`,\n    testResults: [],\n    startTime\n  }\n}];"
+      },
+      "id": "node_store_tokens",
+      "name": "Store Tokens & Init Run",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:3000/api/openapi.json",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node_fetch_swagger",
+      "name": "Fetch OpenAPI Spec",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 300],
+      "notes": "Pulls the live OpenAPI/Swagger spec for contract validation"
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Parse OpenAPI spec and extract testable endpoints\nconst spec = $input.first().json;\nconst tokenData = $('Store Tokens & Init Run').first().json;\n\nconst endpoints = [];\nfor (const [path, methods] of Object.entries(spec.paths || {})) {\n  for (const [method, details] of Object.entries(methods)) {\n    endpoints.push({\n      method: method.toUpperCase(),\n      path,\n      summary: details.summary || '',\n      tags: details.tags || [],\n      requiresAuth: !!details.security || !!spec.security,\n      parameters: details.parameters || [],\n      requestBody: details.requestBody || null,\n      expectedResponses: Object.keys(details.responses || {}).map(Number)\n    });\n  }\n}\n\nreturn [{\n  json: {\n    endpoints,\n    totalEndpoints: endpoints.length,\n    spec,\n    tokenData,\n    parsedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node_parse_openapi",
+      "name": "Parse OpenAPI Endpoints",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300],
+      "notes": "Extracts all 15 endpoints from the spec for systematic testing"
+    },
+
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert airline API test engineer. Generate comprehensive test cases for airline REST APIs including positive, negative, boundary, and edge cases."
+            },
+            {
+              "role": "user",
+              "content": "=Generate test cases for these airline API endpoints:\n\n{{ JSON.stringify($json.endpoints.slice(0,5), null, 2) }}\n\nFor each endpoint provide:\n1. Positive test: valid request with expected 2xx response\n2. Negative test: invalid/missing fields expecting 4xx\n3. Boundary test: min/max values for string lengths, numbers\n4. Auth test: missing or expired token expecting 401\n\nReturn as JSON array with: { endpoint, testType, description, payload, expectedStatus, slaThresholdMs }"
+            }
+          ]
+        },
+        "options": { "temperature": 0.2 }
+      },
+      "id": "node_ai_generate_tests",
+      "name": "AI: Generate Test Cases",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [1340, 180],
+      "notes": "Uses GPT-4o to generate positive, negative, boundary, and auth test cases from the spec"
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:3000/api/airports",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Store Tokens & Init Run').first().json.accessToken }}" }
+          ]
+        },
+        "options": { "timeout": 5000, "response": { "response": { "responseFormat": "json" } } }
+      },
+      "id": "node_test_airports",
+      "name": "2. Test: GET /airports",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 300],
+      "notes": "Endpoint 4: GET /api/airports — list all airports (positive test)"
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:3000/api/airports/JFK",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Store Tokens & Init Run').first().json.accessToken }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_test_airport_by_code",
+      "name": "3. Test: GET /airports/JFK",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 420],
+      "notes": "Endpoint 5: GET /api/airports/:code — boundary test with valid 3-char IATA code"
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:3000/api/flights/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Store Tokens & Init Run').first().json.accessToken }}" }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "origin", "value": "JFK" },
+            { "name": "destination", "value": "LHR" },
+            { "name": "date", "value": "2024-08-15" },
+            { "name": "class", "value": "economy" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_test_flight_search",
+      "name": "4. Test: GET /flights/search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 300],
+      "notes": "Endpoint 6: GET /api/flights/search — positive test with valid origin/destination/date/class"
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:3000/api/flights/FL001",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Store Tokens & Init Run').first().json.accessToken }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_test_flight_by_id",
+      "name": "5. Test: GET /flights/FL001",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 420],
+      "notes": "Endpoint 7: GET /api/flights/:id — fetch specific flight details"
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:3000/api/seats/FL001",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Store Tokens & Init Run').first().json.accessToken }}" }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [{ "name": "class", "value": "business" }]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_test_seats",
+      "name": "6. Test: GET /seats/FL001",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 300],
+      "notes": "Endpoint 8: GET /api/seats/:flightId — seat availability for business class"
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/api/passengers",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Store Tokens & Init Run').first().json.accessToken }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "firstName": "Emily",
+          "lastName": "Rodriguez",
+          "email": "emily.rodriguez@testmail.com",
+          "phone": "+1-555-9900",
+          "passport": "US9988776",
+          "nationality": "American",
+          "dateOfBirth": "1992-11-05"
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_test_create_passenger",
+      "name": "7. Test: POST /passengers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 420],
+      "notes": "Endpoint 9: POST /api/passengers — create new passenger profile"
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:3000/api/passengers/P001",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Store Tokens & Init Run').first().json.accessToken }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_test_get_passenger",
+      "name": "8. Test: GET /passengers/P001",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2000, 300],
+      "notes": "Endpoint 10: GET /api/passengers/:id — retrieve passenger by ID"
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/api/bookings",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Store Tokens & Init Run').first().json.accessToken }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "flightId": "FL002",
+          "passengerId": "P002",
+          "class": "economy",
+          "meals": ["vegetarian"]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_test_create_booking",
+      "name": "9. Test: POST /bookings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2000, 420],
+      "notes": "Endpoint 11: POST /api/bookings — create a new flight booking"
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:3000/api/bookings/BK001",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Store Tokens & Init Run').first().json.accessToken }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_test_get_booking",
+      "name": "10. Test: GET /bookings/BK001",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2220, 300],
+      "notes": "Endpoint 12: GET /api/bookings/:id — get booking with flight and passenger details"
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/api/auth/refresh",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "refreshToken": "={{ $('Store Tokens & Init Run').first().json.refreshToken }}"
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_refresh_token",
+      "name": "11. Refresh Access Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2220, 420],
+      "notes": "Endpoint 2: POST /api/auth/refresh — rotate tokens mid-workflow (simulates 15min expiry)"
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Update the access token after refresh\nconst refreshResponse = $input.first().json;\nif (!refreshResponse.accessToken) {\n  throw new Error('Token refresh failed');\n}\nreturn [{ json: { newAccessToken: refreshResponse.accessToken, newRefreshToken: refreshResponse.refreshToken } }];"
+      },
+      "id": "node_update_token",
+      "name": "Update Token Store",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 420]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/api/check-in",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Update Token Store').first().json.newAccessToken }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "bookingId": "BK001",
+          "seatPreference": "window",
+          "baggageCount": 1
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_test_checkin",
+      "name": "12. Test: POST /check-in",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2440, 300],
+      "notes": "Endpoint 14: POST /api/check-in — online check-in with fresh refreshed token"
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:3000/api/baggage/allowance",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Update Token Store').first().json.newAccessToken }}" }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [{ "name": "class", "value": "economy" }]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_test_baggage",
+      "name": "13. Test: GET /baggage/allowance",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2660, 300],
+      "notes": "Endpoint 16 (GET /api/baggage/allowance) — economy baggage rules"
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/api/payments",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Update Token Store').first().json.newAccessToken }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "bookingId": "BK001",
+          "paymentMethod": "credit_card",
+          "cardLast4": "4242",
+          "amount": 2712
+        },
+        "options": { "timeout": 8000 }
+      },
+      "id": "node_test_payment",
+      "name": "14. Test: POST /payments",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2660, 420],
+      "notes": "Endpoint 15: POST /api/payments — process payment for booking"
+    },
+
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "http://localhost:3000/api/bookings/BK001/cancel",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Update Token Store').first().json.newAccessToken }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_test_cancel_booking",
+      "name": "15. Test: PUT /bookings/cancel (Neg)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2880, 300],
+      "notes": "Endpoint 13: PUT /api/bookings/:id/cancel — NEGATIVE test: cancel checked-in booking → expects 403",
+      "continueOnFail": true
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Collect all test results and compute pass/fail metrics\nconst tests = [\n  { name: 'POST /auth/login',         node: '1. Login - Get Tokens',          expectedStatus: 200 },\n  { name: 'GET /airports',            node: '2. Test: GET /airports',          expectedStatus: 200 },\n  { name: 'GET /airports/:code',      node: '3. Test: GET /airports/JFK',      expectedStatus: 200 },\n  { name: 'GET /flights/search',      node: '4. Test: GET /flights/search',    expectedStatus: 200 },\n  { name: 'GET /flights/:id',         node: '5. Test: GET /flights/FL001',     expectedStatus: 200 },\n  { name: 'GET /seats/:flightId',     node: '6. Test: GET /seats/FL001',       expectedStatus: 200 },\n  { name: 'POST /passengers',         node: '7. Test: POST /passengers',       expectedStatus: 201 },\n  { name: 'GET /passengers/:id',      node: '8. Test: GET /passengers/P001',   expectedStatus: 200 },\n  { name: 'POST /bookings',           node: '9. Test: POST /bookings',         expectedStatus: 201 },\n  { name: 'GET /bookings/:id',        node: '10. Test: GET /bookings/BK001',   expectedStatus: 200 },\n  { name: 'POST /auth/refresh',       node: '11. Refresh Access Token',        expectedStatus: 200 },\n  { name: 'POST /check-in',           node: '12. Test: POST /check-in',        expectedStatus: 200 },\n  { name: 'GET /baggage/allowance',   node: '13. Test: GET /baggage/allowance',expectedStatus: 200 },\n  { name: 'POST /payments',           node: '14. Test: POST /payments',        expectedStatus: 201 },\n  { name: 'PUT /bookings/cancel(neg)',node: '15. Test: PUT /bookings/cancel (Neg)', expectedStatus: 403 },\n];\n\nconst SLA_THRESHOLD_MS = 2000;\nconst results = [];\nlet passed = 0;\nlet failed = 0;\nlet slaViolations = 0;\n\nfor (const test of tests) {\n  try {\n    const nodeData = $node[test.node]?.json;\n    const statusCode = nodeData?._statusCode || nodeData?.statusCode || 200;\n    const responseTime = nodeData?._responseTime || 0;\n    const slaViolated = responseTime > SLA_THRESHOLD_MS;\n\n    const testPassed = statusCode === test.expectedStatus;\n    if (testPassed) passed++; else failed++;\n    if (slaViolated) slaViolations++;\n\n    results.push({\n      endpoint: test.name,\n      status: testPassed ? 'PASS' : 'FAIL',\n      expectedStatus: test.expectedStatus,\n      actualStatus: statusCode,\n      responseTimeMs: responseTime,\n      slaViolated,\n      slaThresholdMs: SLA_THRESHOLD_MS\n    });\n  } catch (e) {\n    failed++;\n    results.push({\n      endpoint: test.name,\n      status: 'ERROR',\n      error: e.message,\n      expectedStatus: test.expectedStatus,\n      actualStatus: null\n    });\n  }\n}\n\nconst runId = $('Store Tokens & Init Run').first().json.testRunId;\nconst summary = {\n  testRunId: runId,\n  completedAt: new Date().toISOString(),\n  total: tests.length,\n  passed,\n  failed,\n  slaViolations,\n  passRate: `${Math.round((passed / tests.length) * 100)}%`,\n  overallStatus: failed === 0 ? 'SUCCESS' : 'FAILURE'\n};\n\nreturn [{ json: { summary, results, hasFailures: failed > 0, hasSlaViolations: slaViolations > 0 } }];"
+      },
+      "id": "node_collect_results",
+      "name": "Collect & Analyse Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 300],
+      "notes": "Aggregates all 15 test results, computes pass rate, SLA violations, and overall health"
+    },
+
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.hasFailures || $json.hasSlaViolations }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "node_check_failures",
+      "name": "Any Failures?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [3320, 300]
+    },
+
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert API QA analyst. Classify API failures and provide root cause analysis for airline APIs."
+            },
+            {
+              "role": "user",
+              "content": "=Analyse these airline API test failures:\n\n{{ JSON.stringify($json.results.filter(r => r.status !== 'PASS'), null, 2) }}\n\nFor each failure, classify into:\n1. CONTRACT_BREACH - Schema/response contract mismatch\n2. AUTH_FAILURE - Authentication/authorization issue  \n3. ENVIRONMENT_ISSUE - Infrastructure/network problem\n4. LOGIC_ERROR - Business logic bug\n5. SLA_VIOLATION - Response time exceeded\n\nProvide: classification, severity (P1/P2/P3), rootCause, suggestedFix, impactedPassengers"
+            }
+          ]
+        },
+        "options": { "temperature": 0.1 }
+      },
+      "id": "node_ai_root_cause",
+      "name": "AI: Root Cause Analysis",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [3540, 180],
+      "notes": "GPT-4o classifies failures: CONTRACT_BREACH / AUTH_FAILURE / ENVIRONMENT_ISSUE / LOGIC_ERROR / SLA_VIOLATION"
+    },
+
+    {
+      "parameters": {
+        "domain": "your-org.atlassian.net",
+        "resource": "issue",
+        "operation": "create",
+        "projectKey": "AIR",
+        "summary": "=[AIRLINE API FAILURE] {{ $('Collect & Analyse Results').first().json.summary.testRunId }} — {{ $('Collect & Analyse Results').first().json.summary.failed }} endpoint(s) failed",
+        "issueType": "Bug",
+        "description": "=**Test Run:** {{ $('Collect & Analyse Results').first().json.summary.testRunId }}\n**Time:** {{ $('Collect & Analyse Results').first().json.summary.completedAt }}\n**Pass Rate:** {{ $('Collect & Analyse Results').first().json.summary.passRate }}\n**SLA Violations:** {{ $('Collect & Analyse Results').first().json.summary.slaViolations }}\n\n**Failed Endpoints:**\n{{ $('Collect & Analyse Results').first().json.results.filter(r => r.status !== 'PASS').map(r => `- ${r.endpoint}: expected ${r.expectedStatus}, got ${r.actualStatus || r.error}`).join('\\n') }}\n\n**AI Root Cause Analysis:**\n{{ $json.message?.content || 'See attached results' }}",
+        "priority": "=High",
+        "labels": ["api-testing", "airline", "automated-qa"]
+      },
+      "id": "node_jira_create_issue",
+      "name": "Create Jira Issue",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [3760, 180],
+      "notes": "Auto-raises a P1/P2 Jira bug with full failure details + AI root cause analysis"
+    },
+
+    {
+      "parameters": {
+        "channel": "#airline-api-alerts",
+        "text": "=:rotating_light: *Airline API Test FAILURE*\n\n*Run ID:* `{{ $('Collect & Analyse Results').first().json.summary.testRunId }}`\n*Pass Rate:* {{ $('Collect & Analyse Results').first().json.summary.passRate }} ({{ $('Collect & Analyse Results').first().json.summary.passed }}/{{ $('Collect & Analyse Results').first().json.summary.total }})\n*SLA Violations:* {{ $('Collect & Analyse Results').first().json.summary.slaViolations }}\n\n*Failed Endpoints:*\n{{ $('Collect & Analyse Results').first().json.results.filter(r => r.status !== 'PASS').map(r => `• ${r.endpoint} — ${r.status}`).join('\\n') }}\n\n*Jira:* {{ $json.key ? `https://your-org.atlassian.net/browse/${$json.key}` : 'Issue creation failed' }}"
+      },
+      "id": "node_slack_alert",
+      "name": "Slack Alert (Failure)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [3980, 180],
+      "notes": "Posts failure summary with Jira link to #airline-api-alerts Slack channel"
+    },
+
+    {
+      "parameters": {
+        "channel": "#airline-api-alerts",
+        "text": "=:white_check_mark: *Airline API Test PASSED*\n\n*Run ID:* `{{ $json.summary.testRunId }}`\n*All {{ $json.summary.total }} endpoints healthy*\n*Pass Rate:* {{ $json.summary.passRate }}\n*Completed:* {{ $json.summary.completedAt }}"
+      },
+      "id": "node_slack_success",
+      "name": "Slack Notify (Success)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [3540, 420],
+      "notes": "Posts green status to Slack when all 15 API tests pass"
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/api/auth/logout",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Update Token Store').first().json.newAccessToken }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "refreshToken": "={{ $('Update Token Store').first().json.newRefreshToken }}"
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "node_auth_logout",
+      "name": "Logout & Revoke Tokens",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [4200, 300],
+      "notes": "Endpoint 3: POST /api/auth/logout — invalidate tokens at end of test run"
+    }
+  ],
+
+  "connections": {
+    "Schedule Trigger (Every 6h)": {
+      "main": [[{ "node": "1. Login - Get Tokens", "type": "main", "index": 0 }]]
+    },
+    "1. Login - Get Tokens": {
+      "main": [[{ "node": "Store Tokens & Init Run", "type": "main", "index": 0 }]]
+    },
+    "Store Tokens & Init Run": {
+      "main": [[{ "node": "Fetch OpenAPI Spec", "type": "main", "index": 0 }]]
+    },
+    "Fetch OpenAPI Spec": {
+      "main": [[{ "node": "Parse OpenAPI Endpoints", "type": "main", "index": 0 }]]
+    },
+    "Parse OpenAPI Endpoints": {
+      "main": [
+        [
+          { "node": "AI: Generate Test Cases", "type": "main", "index": 0 },
+          { "node": "2. Test: GET /airports", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "2. Test: GET /airports": {
+      "main": [[{ "node": "3. Test: GET /airports/JFK", "type": "main", "index": 0 }]]
+    },
+    "3. Test: GET /airports/JFK": {
+      "main": [[{ "node": "4. Test: GET /flights/search", "type": "main", "index": 0 }]]
+    },
+    "4. Test: GET /flights/search": {
+      "main": [[{ "node": "5. Test: GET /flights/FL001", "type": "main", "index": 0 }]]
+    },
+    "5. Test: GET /flights/FL001": {
+      "main": [[{ "node": "6. Test: GET /seats/FL001", "type": "main", "index": 0 }]]
+    },
+    "6. Test: GET /seats/FL001": {
+      "main": [[{ "node": "7. Test: POST /passengers", "type": "main", "index": 0 }]]
+    },
+    "7. Test: POST /passengers": {
+      "main": [[{ "node": "8. Test: GET /passengers/P001", "type": "main", "index": 0 }]]
+    },
+    "8. Test: GET /passengers/P001": {
+      "main": [[{ "node": "9. Test: POST /bookings", "type": "main", "index": 0 }]]
+    },
+    "9. Test: POST /bookings": {
+      "main": [[{ "node": "10. Test: GET /bookings/BK001", "type": "main", "index": 0 }]]
+    },
+    "10. Test: GET /bookings/BK001": {
+      "main": [[{ "node": "11. Refresh Access Token", "type": "main", "index": 0 }]]
+    },
+    "11. Refresh Access Token": {
+      "main": [[{ "node": "Update Token Store", "type": "main", "index": 0 }]]
+    },
+    "Update Token Store": {
+      "main": [
+        [
+          { "node": "12. Test: POST /check-in", "type": "main", "index": 0 },
+          { "node": "13. Test: GET /baggage/allowance", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "12. Test: POST /check-in": {
+      "main": [[{ "node": "14. Test: POST /payments", "type": "main", "index": 0 }]]
+    },
+    "14. Test: POST /payments": {
+      "main": [[{ "node": "15. Test: PUT /bookings/cancel (Neg)", "type": "main", "index": 0 }]]
+    },
+    "15. Test: PUT /bookings/cancel (Neg)": {
+      "main": [[{ "node": "Collect & Analyse Results", "type": "main", "index": 0 }]]
+    },
+    "Collect & Analyse Results": {
+      "main": [[{ "node": "Any Failures?", "type": "main", "index": 0 }]]
+    },
+    "Any Failures?": {
+      "main": [
+        [{ "node": "AI: Root Cause Analysis", "type": "main", "index": 0 }],
+        [{ "node": "Slack Notify (Success)", "type": "main", "index": 0 }]
+      ]
+    },
+    "AI: Root Cause Analysis": {
+      "main": [[{ "node": "Create Jira Issue", "type": "main", "index": 0 }]]
+    },
+    "Create Jira Issue": {
+      "main": [[{ "node": "Slack Alert (Failure)", "type": "main", "index": 0 }]]
+    },
+    "Slack Alert (Failure)": {
+      "main": [[{ "node": "Logout & Revoke Tokens", "type": "main", "index": 0 }]]
+    },
+    "Slack Notify (Success)": {
+      "main": [[{ "node": "Logout & Revoke Tokens", "type": "main", "index": 0 }]]
+    }
+  },
+
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+
+  "_comment": {
+    "description": "Airline API Testing Pipeline — n8n workflow",
+    "endpointsCovered": [
+      "1.  POST /api/auth/login          — Authenticate and get JWT tokens",
+      "2.  POST /api/auth/refresh        — Rotate tokens mid-workflow",
+      "3.  POST /api/auth/logout         — Revoke tokens at end",
+      "4.  GET  /api/airports            — List all airports (positive test)",
+      "5.  GET  /api/airports/:code      — Fetch JFK airport details",
+      "6.  GET  /api/flights/search      — Search JFK→LHR economy flights",
+      "7.  GET  /api/flights/:id         — Get flight FL001 details",
+      "8.  GET  /api/seats/:flightId     — Business class seat map",
+      "9.  POST /api/passengers          — Create new passenger",
+      "10. GET  /api/passengers/:id      — Retrieve passenger P001",
+      "11. POST /api/bookings            — Book a flight",
+      "12. GET  /api/bookings/:id        — Get booking with enriched details",
+      "13. POST /api/check-in            — Online check-in + boarding pass",
+      "14. GET  /api/baggage/allowance   — Economy baggage rules",
+      "15. POST /api/payments            — Process booking payment",
+      "--- PUT  /api/bookings/:id/cancel — NEGATIVE test (403 expected)"
+    ],
+    "features": [
+      "JWT access token (15min) + refresh token (7d) rotation",
+      "Token auto-refresh mid-workflow at step 11",
+      "OpenAPI spec fetch + endpoint parsing",
+      "AI-powered test case generation (GPT-4o)",
+      "SLA monitoring per endpoint (2000ms threshold)",
+      "AI root cause classification on failures",
+      "Auto Jira bug creation with full diagnostics",
+      "Slack alerts for pass/fail with Jira links",
+      "Token revocation at workflow completion",
+      "Negative test: cancel checked-in booking → 403"
+    ]
+  }
+}

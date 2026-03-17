@@ -1,0 +1,440 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "SkyLine Airline API",
+    "description": "Complete airline management REST API with JWT + Refresh Token authentication. Covers flights, bookings, passengers, airports, check-in, and payments.",
+    "version": "1.0.0",
+    "contact": {
+      "name": "SkyLine API Support",
+      "email": "api-support@skyline.com"
+    }
+  },
+  "servers": [
+    { "url": "http://localhost:3000", "description": "Local Development" }
+  ],
+  "tags": [
+    { "name": "Auth", "description": "Authentication & token management" },
+    { "name": "Airports", "description": "Airport information" },
+    { "name": "Flights", "description": "Flight search and details" },
+    { "name": "Seats", "description": "Seat availability" },
+    { "name": "Passengers", "description": "Passenger management" },
+    { "name": "Bookings", "description": "Booking operations" },
+    { "name": "Check-in", "description": "Online check-in" },
+    { "name": "Baggage", "description": "Baggage allowance" },
+    { "name": "Payments", "description": "Payment processing" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Access token (15 min expiry). Use /api/auth/refresh to renew."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string" },
+          "code": { "type": "string" }
+        }
+      },
+      "Airport": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string", "example": "JFK", "minLength": 3, "maxLength": 3 },
+          "name": { "type": "string" },
+          "city": { "type": "string" },
+          "country": { "type": "string" },
+          "timezone": { "type": "string" }
+        }
+      },
+      "Flight": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "flightNumber": { "type": "string" },
+          "airline": { "type": "string" },
+          "origin": { "type": "string" },
+          "destination": { "type": "string" },
+          "departureTime": { "type": "string", "format": "date-time" },
+          "arrivalTime": { "type": "string", "format": "date-time" },
+          "duration": { "type": "integer", "description": "Duration in minutes" },
+          "status": { "type": "string", "enum": ["scheduled", "delayed", "cancelled", "departed", "landed"] },
+          "aircraft": { "type": "string" },
+          "totalSeats": { "type": "integer" },
+          "availableSeats": { "type": "integer" }
+        }
+      },
+      "Passenger": {
+        "type": "object",
+        "required": ["firstName", "lastName", "email", "passport"],
+        "properties": {
+          "id": { "type": "string" },
+          "firstName": { "type": "string", "minLength": 1, "maxLength": 50 },
+          "lastName": { "type": "string", "minLength": 1, "maxLength": 50 },
+          "email": { "type": "string", "format": "email" },
+          "phone": { "type": "string" },
+          "passport": { "type": "string", "minLength": 6, "maxLength": 20 },
+          "nationality": { "type": "string" },
+          "dateOfBirth": { "type": "string", "format": "date" },
+          "frequentFlyerId": { "type": "string" },
+          "tier": { "type": "string", "enum": ["bronze", "silver", "gold", "platinum"] }
+        }
+      },
+      "Booking": {
+        "type": "object",
+        "required": ["flightId", "passengerId", "class"],
+        "properties": {
+          "id": { "type": "string" },
+          "pnr": { "type": "string" },
+          "flightId": { "type": "string" },
+          "passengerId": { "type": "string" },
+          "class": { "type": "string", "enum": ["economy", "business", "first"] },
+          "seatNumber": { "type": "string" },
+          "status": { "type": "string", "enum": ["confirmed", "cancelled", "waitlisted"] },
+          "fare": { "type": "number" },
+          "taxes": { "type": "number" },
+          "totalAmount": { "type": "number" },
+          "baggageAllowance": { "type": "string" },
+          "checkedIn": { "type": "boolean" },
+          "meals": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  },
+  "security": [{ "BearerAuth": [] }],
+  "paths": {
+    "/api/auth/login": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Login and obtain access + refresh tokens",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email", "password"],
+                "properties": {
+                  "email": { "type": "string", "format": "email", "example": "admin@skyline.com" },
+                  "password": { "type": "string", "minLength": 8, "example": "Admin@1234" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Login successful",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "accessToken": { "type": "string" },
+                    "refreshToken": { "type": "string" },
+                    "expiresIn": { "type": "integer", "example": 900 },
+                    "user": {
+                      "type": "object",
+                      "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "email": { "type": "string" },
+                        "role": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Missing email or password", "$ref": "#/components/schemas/Error" },
+          "401": { "description": "Invalid credentials" }
+        }
+      }
+    },
+    "/api/auth/refresh": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Refresh the access token using a valid refresh token",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["refreshToken"],
+                "properties": {
+                  "refreshToken": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "New access and refresh tokens" },
+          "400": { "description": "Refresh token missing" },
+          "403": { "description": "Refresh token revoked or expired" }
+        }
+      }
+    },
+    "/api/auth/logout": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Logout and invalidate refresh token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "refreshToken": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Logged out" },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/api/airports": {
+      "get": {
+        "tags": ["Airports"],
+        "summary": "List all airports with optional filters",
+        "parameters": [
+          { "name": "country", "in": "query", "schema": { "type": "string" } },
+          { "name": "city", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of airports",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": { "type": "integer" },
+                    "airports": { "type": "array", "items": { "$ref": "#/components/schemas/Airport" } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/airports/{code}": {
+      "get": {
+        "tags": ["Airports"],
+        "summary": "Get a single airport by IATA code",
+        "parameters": [
+          { "name": "code", "in": "path", "required": true, "schema": { "type": "string", "minLength": 3, "maxLength": 3 }, "example": "JFK" }
+        ],
+        "responses": {
+          "200": { "description": "Airport details", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Airport" } } } },
+          "404": { "description": "Airport not found" }
+        }
+      }
+    },
+    "/api/flights/search": {
+      "get": {
+        "tags": ["Flights"],
+        "summary": "Search available flights",
+        "parameters": [
+          { "name": "origin", "in": "query", "required": true, "schema": { "type": "string" }, "example": "JFK" },
+          { "name": "destination", "in": "query", "required": true, "schema": { "type": "string" }, "example": "LHR" },
+          { "name": "date", "in": "query", "schema": { "type": "string", "format": "date" }, "example": "2024-08-15" },
+          { "name": "class", "in": "query", "schema": { "type": "string", "enum": ["economy", "business", "first"] } }
+        ],
+        "responses": {
+          "200": { "description": "Matching flights" },
+          "400": { "description": "Origin and destination required" }
+        }
+      }
+    },
+    "/api/flights/{id}": {
+      "get": {
+        "tags": ["Flights"],
+        "summary": "Get flight details by ID",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "example": "FL001" }
+        ],
+        "responses": {
+          "200": { "description": "Flight details", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Flight" } } } },
+          "404": { "description": "Flight not found" }
+        }
+      }
+    },
+    "/api/seats/{flightId}": {
+      "get": {
+        "tags": ["Seats"],
+        "summary": "Get seat availability for a flight",
+        "parameters": [
+          { "name": "flightId", "in": "path", "required": true, "schema": { "type": "string" }, "example": "FL001" },
+          { "name": "class", "in": "query", "schema": { "type": "string", "enum": ["economy", "business", "first"] } }
+        ],
+        "responses": {
+          "200": { "description": "Seat map" },
+          "404": { "description": "Flight not found" }
+        }
+      }
+    },
+    "/api/passengers": {
+      "post": {
+        "tags": ["Passengers"],
+        "summary": "Create a new passenger profile",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/Passenger" }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Passenger created" },
+          "400": { "description": "Validation error" },
+          "409": { "description": "Duplicate passport" }
+        }
+      }
+    },
+    "/api/passengers/{id}": {
+      "get": {
+        "tags": ["Passengers"],
+        "summary": "Get passenger by ID",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "example": "P001" }
+        ],
+        "responses": {
+          "200": { "description": "Passenger details", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Passenger" } } } },
+          "404": { "description": "Passenger not found" }
+        }
+      }
+    },
+    "/api/bookings": {
+      "post": {
+        "tags": ["Bookings"],
+        "summary": "Create a new flight booking",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/Booking" }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Booking confirmed" },
+          "400": { "description": "Validation error" },
+          "404": { "description": "Flight or passenger not found" },
+          "409": { "description": "No seat availability" }
+        }
+      }
+    },
+    "/api/bookings/{id}": {
+      "get": {
+        "tags": ["Bookings"],
+        "summary": "Get booking details",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "example": "BK001" }
+        ],
+        "responses": {
+          "200": { "description": "Booking with flight and passenger details" },
+          "404": { "description": "Booking not found" }
+        }
+      }
+    },
+    "/api/bookings/{id}/cancel": {
+      "put": {
+        "tags": ["Bookings"],
+        "summary": "Cancel a confirmed booking",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "example": "BK001" }
+        ],
+        "responses": {
+          "200": { "description": "Booking cancelled with refund info" },
+          "403": { "description": "Cannot cancel checked-in booking" },
+          "404": { "description": "Booking not found" },
+          "409": { "description": "Already cancelled" }
+        }
+      }
+    },
+    "/api/check-in": {
+      "post": {
+        "tags": ["Check-in"],
+        "summary": "Perform online check-in for a booking",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["bookingId"],
+                "properties": {
+                  "bookingId": { "type": "string", "example": "BK001" },
+                  "seatPreference": { "type": "string", "enum": ["window", "aisle", "middle"] },
+                  "baggageCount": { "type": "integer", "minimum": 0, "maximum": 5 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Check-in successful with boarding pass" },
+          "400": { "description": "Missing bookingId" },
+          "404": { "description": "Booking not found" },
+          "409": { "description": "Already checked in or booking cancelled" }
+        }
+      }
+    },
+    "/api/baggage/allowance": {
+      "get": {
+        "tags": ["Baggage"],
+        "summary": "Get baggage allowance by class",
+        "parameters": [
+          { "name": "class", "in": "query", "schema": { "type": "string", "enum": ["economy", "business", "first"] } },
+          { "name": "route", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Baggage allowance details" },
+          "400": { "description": "Invalid class" }
+        }
+      }
+    },
+    "/api/payments": {
+      "post": {
+        "tags": ["Payments"],
+        "summary": "Process payment for a booking",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["bookingId", "paymentMethod", "amount"],
+                "properties": {
+                  "bookingId": { "type": "string", "example": "BK001" },
+                  "paymentMethod": { "type": "string", "enum": ["credit_card", "debit_card", "paypal", "bank_transfer"] },
+                  "cardLast4": { "type": "string", "minLength": 4, "maxLength": 4, "example": "4242" },
+                  "amount": { "type": "number", "minimum": 0, "example": 2712 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Payment processed" },
+          "400": { "description": "Validation error or insufficient payment" },
+          "404": { "description": "Booking not found" }
+        }
+      }
+    }
+  }
+}
