@@ -1,0 +1,305 @@
+{
+  "name": "Bot Process Execution & File Upload",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "node_manual_trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "Start workflow manually"
+    },
+
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "1", "name": "org",                "value": "ops",                              "type": "string" },
+            { "id": "2", "name": "botId",              "value": 76,                                 "type": "number" },
+            { "id": "3", "name": "processId",          "value": 53,                                 "type": "number" },
+            { "id": "4", "name": "apiHostUrl",         "value": "http://192.168.0.109:3001",        "type": "string" },
+            { "id": "5", "name": "filePresence",       "value": "true",                             "type": "string" },
+            { "id": "6", "name": "tool",               "value": "UIPATH",                           "type": "string" },
+            { "id": "7", "name": "fileAttachmentPath", "value": "D:\\opstesting\\castInvoice3.pdf",  "type": "string" },
+            { "id": "8", "name": "transactionId",      "value": "LCS361208180123",                  "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node_set_config",
+      "name": "Set Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 300],
+      "notes": "Central config — edit org, botId, processId, host, file path here"
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.apiHostUrl }}/api/application/login",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-org", "value": "={{ $json.org }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "username": "botman",
+          "password": "12345Welcome"
+        },
+        "options": { "timeout": 15000 }
+      },
+      "id": "node_login",
+      "name": "Login",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300],
+      "notes": "POST /api/application/login — returns bearer token in .message"
+    },
+
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "1", "name": "authToken",          "value": "={{ $json.message }}",             "type": "string" },
+            { "id": "2", "name": "org",                "value": "={{ $('Set Config').item.json.org }}", "type": "string" },
+            { "id": "3", "name": "botId",              "value": "={{ $('Set Config').item.json.botId }}", "type": "number" },
+            { "id": "4", "name": "processId",          "value": "={{ $('Set Config').item.json.processId }}", "type": "number" },
+            { "id": "5", "name": "apiHostUrl",         "value": "={{ $('Set Config').item.json.apiHostUrl }}", "type": "string" },
+            { "id": "6", "name": "filePresence",       "value": "={{ $('Set Config').item.json.filePresence }}", "type": "string" },
+            { "id": "7", "name": "tool",               "value": "={{ $('Set Config').item.json.tool }}", "type": "string" },
+            { "id": "8", "name": "transactionId",      "value": "={{ $('Set Config').item.json.transactionId }}", "type": "string" },
+            { "id": "9", "name": "fileAttachmentPath", "value": "={{ $('Set Config').item.json.fileAttachmentPath }}", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node_store_token",
+      "name": "Store Auth Token",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [900, 300],
+      "notes": "Extracts bearer token from login response and merges config forward"
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.apiHostUrl }}/api/datafeed/processExecution",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-org",         "value": "={{ $json.org }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $json.authToken }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "Bot_ID":        "={{ $json.botId }}",
+          "Process_ID":    "={{ $json.processId }}",
+          "IsFileAvailable": "={{ $json.filePresence }}",
+          "Tool":          "={{ $json.tool }}"
+        },
+        "options": { "timeout": 15000 }
+      },
+      "id": "node_process_execution",
+      "name": "Process Execution",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 300],
+      "notes": "POST /api/datafeed/processExecution — returns execution ID in .message"
+    },
+
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "1", "name": "executionId",        "value": "={{ $json.message }}",             "type": "string" },
+            { "id": "2", "name": "authToken",          "value": "={{ $('Store Auth Token').item.json.authToken }}", "type": "string" },
+            { "id": "3", "name": "org",                "value": "={{ $('Store Auth Token').item.json.org }}", "type": "string" },
+            { "id": "4", "name": "apiHostUrl",         "value": "={{ $('Store Auth Token').item.json.apiHostUrl }}", "type": "string" },
+            { "id": "5", "name": "transactionId",      "value": "={{ $('Store Auth Token').item.json.transactionId }}", "type": "string" },
+            { "id": "6", "name": "fileAttachmentPath", "value": "={{ $('Store Auth Token').item.json.fileAttachmentPath }}", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node_store_execution_id",
+      "name": "Store Execution ID",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1340, 300],
+      "notes": "Extracts execution ID from processExecution response"
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.apiHostUrl }}/api/datafeed/transaction",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-org",         "value": "={{ $json.org }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $json.authToken }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "ExecutionId":   "={{ $json.executionId }}",
+          "Transaction_ID": "={{ $json.transactionId }}",
+          "Status":        "Success",
+          "Remarks":       "Data From Windows To Ubuntu",
+          "Key1":          "",
+          "Key2":          "",
+          "TransactionValidations": [
+            {
+              "MaterialId":   "={{ $json.transactionId }}",
+              "Description":  "Files",
+              "Validation":   "Testing from powershell in windows",
+              "ReferenceValue": "3",
+              "InputValue":   "2",
+              "Status":       "Success",
+              "Remarks":      "Data From windows to Ubuntu"
+            }
+          ]
+        },
+        "options": { "timeout": 15000 }
+      },
+      "id": "node_transaction",
+      "name": "Post Transaction",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 300],
+      "notes": "POST /api/datafeed/transaction — returns transactionDetailId in .message"
+    },
+
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "1", "name": "transactionDetailId", "value": "={{ $json.message }}",            "type": "string" },
+            { "id": "2", "name": "authToken",           "value": "={{ $('Store Execution ID').item.json.authToken }}", "type": "string" },
+            { "id": "3", "name": "org",                 "value": "={{ $('Store Execution ID').item.json.org }}", "type": "string" },
+            { "id": "4", "name": "apiHostUrl",          "value": "={{ $('Store Execution ID').item.json.apiHostUrl }}", "type": "string" },
+            { "id": "5", "name": "fileAttachmentPath",  "value": "={{ $('Store Execution ID').item.json.fileAttachmentPath }}", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node_store_txn_detail_id",
+      "name": "Store Transaction Detail ID",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1780, 300],
+      "notes": "Extracts transactionDetailId used as path param for file upload"
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.apiHostUrl }}/api/filestore/file/Upload/{{ $json.transactionDetailId }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-org",         "value": "={{ $json.org }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $json.authToken }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "FILE",
+              "inputDataFieldName": "fileData"
+            }
+          ]
+        },
+        "options": { "timeout": 30000 }
+      },
+      "id": "node_file_upload",
+      "name": "Upload File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2220, 300],
+      "notes": "POST /api/filestore/file/Upload/{transactionDetailId} — multipart upload of FILE field"
+    },
+
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "1", "name": "uploadResult", "value": "={{ $json.message }}", "type": "string" },
+            { "id": "2", "name": "status",       "value": "completed",            "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node_final_output",
+      "name": "Final Output",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [2440, 300],
+      "notes": "Captures the file upload result message"
+    },
+
+    {
+      "parameters": {
+        "filePath": "={{ $('Store Transaction Detail ID').item.json.fileAttachmentPath }}",
+        "options": {}
+      },
+      "id": "node_read_file",
+      "name": "Read File from Disk",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [2000, 300],
+      "notes": "Reads the PDF from the local path defined in Set Config. Output binary key = 'fileData'"
+    }
+  ],
+
+  "connections": {
+    "Manual Trigger": {
+      "main": [[{ "node": "Set Config", "type": "main", "index": 0 }]]
+    },
+    "Set Config": {
+      "main": [[{ "node": "Login", "type": "main", "index": 0 }]]
+    },
+    "Login": {
+      "main": [[{ "node": "Store Auth Token", "type": "main", "index": 0 }]]
+    },
+    "Store Auth Token": {
+      "main": [[{ "node": "Process Execution", "type": "main", "index": 0 }]]
+    },
+    "Process Execution": {
+      "main": [[{ "node": "Store Execution ID", "type": "main", "index": 0 }]]
+    },
+    "Store Execution ID": {
+      "main": [[{ "node": "Post Transaction", "type": "main", "index": 0 }]]
+    },
+    "Post Transaction": {
+      "main": [[{ "node": "Store Transaction Detail ID", "type": "main", "index": 0 }]]
+    },
+    "Store Transaction Detail ID": {
+      "main": [[{ "node": "Read File from Disk", "type": "main", "index": 0 }]]
+    },
+    "Read File from Disk": {
+      "main": [[{ "node": "Upload File", "type": "main", "index": 0 }]]
+    },
+    "Upload File": {
+      "main": [[{ "node": "Final Output", "type": "main", "index": 0 }]]
+    }
+  },
+
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["bot-automation", "file-upload", "uipath"]
+}
